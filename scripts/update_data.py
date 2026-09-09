@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -21,6 +23,7 @@ BINANCE_FUNDING_ENDPOINTS = (
     "https://fapi2.binance.com/fapi/v1/fundingRate",
 )
 OKX_FUNDING_RATE_HISTORY_URL = "https://www.okx.com/api/v5/public/funding-rate-history"
+BINANCE_FUNDING_ARCHIVE_URL = "https://data.binance.vision/data/futures/um/monthly/fundingRate"
 FNG_URL = "https://api.alternative.me/fng/"
 FNG_KNOWN_MISSING_TIMESTAMPS = tuple(
     pd.Timestamp(day, tz="UTC")
@@ -42,7 +45,7 @@ MVRV_BOOTSTRAP_START_TIMES = {
     "eth": pd.Timestamp("2015-07-30T00:00:00Z"),
 }
 SPOT_BOOTSTRAP_START_TIME = pd.Timestamp("2017-08-17T00:00:00Z")
-FUNDING_BOOTSTRAP_START_TIME = pd.Timestamp("2019-09-10T00:00:00Z")
+FUNDING_BOOTSTRAP_START_TIME = pd.Timestamp("2020-01-01T00:00:00Z")
 FUNDING_FAILURE_POLICY_ENV = "FUNDING_FAILURE_POLICY"
 
 
@@ -411,7 +414,7 @@ def fetch_binance_funding_rates(symbol: str, start_time: pd.Timestamp | None) ->
         for item in payload:
             rows.append(
                 {
-                    "timestamp": pd.to_datetime(item["fundingTime"], unit="ms", utc=True),
+                    "timestamp": pd.to_datetime(item["fundingTime"], unit="ms", utc=True).floor("8h"),
                     "funding_rate": float(item["fundingRate"]),
                 }
             )
@@ -479,6 +482,48 @@ def fetch_okx_funding_rates(symbol: str, start_time: pd.Timestamp | None) -> pd.
     return pd.DataFrame(rows)
 
 
+def _month_starts(start_time: pd.Timestamp) -> list[pd.Timestamp]:
+    first_month = start_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    current_month = pd.Timestamp.now(tz="UTC").replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return list(pd.date_range(first_month, current_month, freq="MS", tz="UTC"))
+
+
+def fetch_binance_funding_rate_archive(symbol: str, start_time: pd.Timestamp) -> pd.DataFrame:
+    rows = []
+    current_month = pd.Timestamp.now(tz="UTC").replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    for month in _month_starts(start_time):
+        month_key = month.strftime("%Y-%m")
+        url = f"{BINANCE_FUNDING_ARCHIVE_URL}/{symbol}/{symbol}-fundingRate-{month_key}.zip"
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+            if response.status_code == 404 and month == current_month:
+                continue
+            response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                names = archive.namelist()
+                if len(names) != 1:
+                    raise ValueError(f"expected one CSV file, found {names}")
+                frame = pd.read_csv(archive.open(names[0]))
+        except (requests.exceptions.RequestException, ValueError, zipfile.BadZipFile) as exc:
+            raise FundingRateRequestError(
+                f"Binance funding-rate archive request failed for {symbol} {month_key}: {exc}"
+            ) from exc
+
+        required_columns = {"calc_time", "last_funding_rate"}
+        if missing_columns := required_columns.difference(frame.columns):
+            raise FundingRateRequestError(
+                f"Binance funding-rate archive schema changed for {symbol} {month_key}: "
+                f"missing {sorted(missing_columns)}"
+            )
+        for item in frame.itertuples(index=False):
+            timestamp = pd.to_datetime(int(item.calc_time), unit="ms", utc=True).floor("8h")
+            if timestamp >= start_time:
+                rows.append({"timestamp": timestamp, "funding_rate": float(item.last_funding_rate)})
+
+    return pd.DataFrame(rows)
+
+
 def fetch_funding_rates(
     symbol: str, start_time: pd.Timestamp | None, funding_sources: list[str]
 ) -> pd.DataFrame:
@@ -491,13 +536,21 @@ def fetch_funding_rates(
             binance_error,
         )
         try:
-            rates = fetch_okx_funding_rates(symbol, start_time)
+            okx_rates = fetch_okx_funding_rates(symbol, start_time)
+            archive_rates = (
+                fetch_binance_funding_rate_archive(symbol, start_time)
+                if start_time is not None
+                else pd.DataFrame()
+            )
         except FundingRateRequestError as okx_error:
             raise FundingRateRequestError(
-                f"Binance primary source failed: {binance_error}; OKX fallback failed: {okx_error}"
+                f"Binance primary source failed: {binance_error}; fallback failed: {okx_error}"
             ) from okx_error
-        funding_sources.append(f"{symbol}: OKX fallback (Binance unavailable: {binance_error})")
-        return rates
+        funding_sources.append(
+            f"{symbol}: OKX recent data and Binance official archive "
+            f"(Binance API unavailable: {binance_error})"
+        )
+        return merge_deduplicate(archive_rates, okx_rates)
 
 
 def fetch_fear_and_greed() -> pd.DataFrame:
@@ -524,12 +577,15 @@ def update_series(
     continuity_frequency: str,
     *,
     bootstrap_start_time: pd.Timestamp | None = None,
+    backfill_start_time: pd.Timestamp | None = None,
     allow_stale_on_fetch_error: bool = False,
     non_fatal_issues: list[str] | None = None,
     issue_context: str | None = None,
 ) -> None:
     existing = _load_existing(path)
-    if existing.empty:
+    if existing.empty or (
+        backfill_start_time is not None and existing["timestamp"].min() > backfill_start_time
+    ):
         start_time = bootstrap_start_time
     else:
         start_time = existing["timestamp"].max() + pd.tseries.frequencies.to_offset(continuity_frequency)
@@ -589,6 +645,7 @@ def update_asset(
         lambda start: fetch_funding_rates(symbol, start, funding_sources),
         continuity_frequency="8h",
         bootstrap_start_time=FUNDING_BOOTSTRAP_START_TIME,
+        backfill_start_time=FUNDING_BOOTSTRAP_START_TIME,
         allow_stale_on_fetch_error=True,
         non_fatal_issues=non_fatal_issues,
         issue_context=symbol,
