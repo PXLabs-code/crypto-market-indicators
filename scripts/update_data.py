@@ -302,12 +302,12 @@ def _write_if_changed(path: Path, df: pd.DataFrame) -> None:
 
 def _display_path(path: Path) -> str:
     try:
-        return str(path.relative_to(DATA_ROOT.parent))
+        return path.relative_to(DATA_ROOT.parent).as_posix()
     except ValueError:
         if "data" in path.parts:
             data_index = path.parts.index("data")
-            return str(Path(*path.parts[data_index:]))
-        return str(path)
+            return Path(*path.parts[data_index:]).as_posix()
+        return path.as_posix()
 
 
 def render_non_fatal_issue_summary(issues: Sequence[str]) -> str:
