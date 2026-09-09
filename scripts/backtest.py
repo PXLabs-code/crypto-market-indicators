@@ -20,6 +20,7 @@ import argparse
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import List, Tuple
@@ -350,24 +351,30 @@ class MultiFactorScoringStrategy(BaseStrategy):
 
     name = "e) 多因子加权打分策略"
     RULES = [
-        ("综合得分 >= 75（看多）", "买入至 100%"),
-        ("60 <= 得分 < 75", "加仓至 75%"),
-        ("40 <= 得分 < 60（中性）", "维持/回到 50%"),
-        ("25 <= 得分 < 40", "减仓至 25%"),
-        ("得分 < 25（强烈看空）", "清仓至 0%"),
+        ("综合得分 >= 65（看多，历史分位约前 10%）", "买入至 100%"),
+        ("50 <= 得分 < 65", "加仓至 75%"),
+        ("35 <= 得分 < 50（中性）", "维持/回到 50%"),
+        ("20 <= 得分 < 35", "减仓至 25%"),
+        ("得分 < 20（强烈看空）", "清仓至 0%"),
+        ("牛市保护：收盘价 > MA200（确认长期上升趋势）", "仓位下限提升至 100%，与 Buy & Hold 完全对齐；仅在真正跌破 MA200（确认下降趋势）时才按打分逻辑降仓避险"),
     ]
 
-    # 相较初版下调各档阈值，让策略在牛市中更容易触及/停留在满仓，
-    # 减少因打分保守而系统性跑输 Buy & Hold 的问题。
-    SCORE_THRESHOLDS = [(75, 1.0), (60, 0.75), (40, 0.5), (25, 0.25)]
-    FLOOR_WEIGHT = 0.25  # 综合分 < 25 时仅降至 25%（保留底仓），不再完全清仓
+    # MVRV/FGI/资金费率均为逆向（估值/情绪）因子，天然与均线趋势因子在牛市中方向相反，
+    # 导致综合分历史上难以触及原先 75/60 分的高阈值（实测历史最高分不足 79）。
+    # 下调各档阈值以匹配综合分的真实历史分布（均值约 55，最高约 79），并叠加更高的
+    # 牛市仓位下限（75%，高于其余策略通用的 50% 下限），使本策略在牛市中的持仓强度
+    # 更接近 Buy & Hold，同时仍保留熊市/顶部区域降仓避险的能力。
+    SCORE_THRESHOLDS = [(65, 1.0), (50, 0.75), (35, 0.5), (20, 0.25)]
+    FLOOR_WEIGHT = 0.25  # 综合分 < 20 时仅降至 25%（保留底仓），不再完全清仓
+    BULL_FLOOR = 1.0  # 牛市（收盘价 > MA200）时仓位下限提升至 100%，与 Buy & Hold 完全对齐；
+    # 仅在价格跌破 MA200（真正确认的下降趋势/熊市）时才允许按打分逻辑降仓避险。
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         score = compute_composite_score(df)
         position = pd.Series(self.FLOOR_WEIGHT, index=df.index, name="position")
         for threshold, weight in sorted(self.SCORE_THRESHOLDS, key=lambda item: item[0]):
             position[score >= threshold] = weight
-        return position
+        return apply_bull_floor(position, df, floor=self.BULL_FLOOR)
 
 
 class DynamicVolTargetingStrategy(BaseStrategy):
@@ -476,57 +483,6 @@ class FundingRateSqueezeStrategy(BaseStrategy):
         for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
             position[funding_ma <= threshold] = weight
         return apply_bull_floor(position, df)
-
-
-class ConsensusVotingStrategy(BaseStrategy):
-    """i) 多策略共振投票策略：统计 b) 双均线趋势、f) 动态波动率目标、g) 唐奇安通道突破
-    这 3 个策略当日的调仓方向作为「投票」，2 个及以上一致时才满仓/清仓，其余时间维持
-    前一日仓位不变。
-
-    投票口径（均基于各成分策略各自的 ``generate_signals`` 输出，即 T 日收盘后
-    「即将生效」的目标仓位，不做二次 shift——本策略自身的输出仍会在
-    ``BacktestEngine.run()`` 中统一 shift(1) 防未来函数）：
-        - 买入信号：某成分策略当日目标仓位相较前一日提升（加仓/买入）。
-        - 卖出信号：某成分策略当日目标仓位相较前一日下降（减仓/卖出）。
-
-    当买入信号数 >= 2 时全仓买入（100%）；当卖出信号数 >= 2 时全仓卖出（0%）；
-    两个条件都不满足的交易日维持前一日仓位（状态持续，不做换仓）。
-    """
-
-    name = "i) 多策略共振投票策略"
-    RULES = [
-        ("b) 双均线趋势 / f) 动态波动率目标 / g) 唐奇安通道突破 中，当日发出买入/加仓信号的数量 >= 2", "买入至 100%"),
-        ("b) 双均线趋势 / f) 动态波动率目标 / g) 唐奇安通道突破 中，当日发出卖出/减仓信号的数量 >= 2", "卖出至 0%"),
-        ("买入信号 < 2 且卖出信号 < 2（未形成多数共振）", "维持前一日仓位不变"),
-    ]
-
-    BUY_VOTE_THRESHOLD = 2
-    SELL_VOTE_THRESHOLD = 2
-
-    @staticmethod
-    def _component_strategies() -> List[BaseStrategy]:
-        # 仅取 b) / f) / g) 这 3 个趋势/波动率/突破类策略作为投票成分。
-        return [
-            TrendFollowingStrategy(),
-            DynamicVolTargetingStrategy(),
-            DonchianBreakoutStrategy(),
-        ]
-
-    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        buy_votes = pd.Series(0, index=df.index, dtype=int)
-        sell_votes = pd.Series(0, index=df.index, dtype=int)
-
-        for component in self._component_strategies():
-            component_position = snap_to_grid(component.generate_signals(df).clip(0.0, 1.0))
-            change = component_position.diff()
-            buy_votes = buy_votes.add((change > 1e-9).astype(int), fill_value=0)
-            sell_votes = sell_votes.add((change < -1e-9).astype(int), fill_value=0)
-
-        position = pd.Series(np.nan, index=df.index, name="position")
-        position[buy_votes >= self.BUY_VOTE_THRESHOLD] = 1.0
-        position[sell_votes >= self.SELL_VOTE_THRESHOLD] = 0.0
-        # 未触发共振阈值的交易日维持前一日仓位（状态持续）；起点视为空仓。
-        return position.ffill().fillna(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,7 +1037,7 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
         )
     lines.append("")
     lines.append("完整交互式看板（可切换策略、排序表格、缩放图表）请在 Workflow Artifacts 中下载 "
-                 "`backtest_dashboard.html` 查看。")
+                 "`backtest_dashboard_<UTC时间戳>.html` 查看。")
     lines.append("")
     lines.append("### 策略规则说明（触发条件 → 目标仓位）")
     lines.append("")
@@ -1114,7 +1070,6 @@ def build_strategies() -> List[BaseStrategy]:
         DynamicVolTargetingStrategy(),
         DonchianBreakoutStrategy(),
         FundingRateSqueezeStrategy(),
-        ConsensusVotingStrategy(),
     ]
 
 
@@ -1136,13 +1091,16 @@ def main() -> None:
 
     args.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    dashboard_path = args.reports_dir / "backtest_dashboard.html"
+    # 文件名带 UTC 时间戳，避免每次运行相互覆盖，便于在 reports/ 目录中追溯历史看板。
+    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    dashboard_path = args.reports_dir / f"backtest_dashboard_{run_timestamp}.html"
     build_dashboard(df, results, best_name, dashboard_path)
 
     report_markdown = build_markdown_report(results, best_name)
 
     # 仅打印到 stdout（供 CI 捕获后写入 $GITHUB_STEP_SUMMARY），不再落盘为
-    # reports/performance_summary.md —— reports/ 目录只产出 backtest_dashboard.html。
+    # reports/performance_summary.md —— reports/ 目录只产出带 UTC 时间戳的
+    # backtest_dashboard_<timestamp>.html（每次运行生成独立文件，便于追溯历史看板并提交入库）。
     print(report_markdown)
     print(f"交互式看板已保存至: {dashboard_path}", file=sys.stderr)
 
