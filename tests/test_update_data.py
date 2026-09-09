@@ -216,6 +216,42 @@ class UpdateDataTests(unittest.TestCase):
             [BINANCE_FUNDING_ENDPOINTS[0], BINANCE_FUNDING_ENDPOINTS[1]],
         )
 
+    @patch("scripts.update_data.time.sleep")
+    @patch("scripts.update_data.requests.get")
+    def test_fetch_binance_funding_rates_retries_invalid_json_then_switches_endpoint(
+        self, mock_get, mock_sleep
+    ):
+        invalid_json_response = self._mock_response(status_code=200, text="")
+        invalid_json_response.json.side_effect = ValueError("Expecting value")
+
+        mock_get.side_effect = [
+            self._mock_response(status_code=451, text="blocked"),
+            invalid_json_response,
+            invalid_json_response,
+            invalid_json_response,
+            self._mock_response(
+                status_code=200,
+                json_data=[{"fundingTime": 1757376000000, "fundingRate": "0.0002"}],
+            ),
+        ]
+
+        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+            df = fetch_binance_funding_rates("BTCUSDT", None)
+
+        self.assertEqual(df.iloc[0]["funding_rate"], 0.0002)
+        self.assertEqual(
+            [call.args[0] for call in mock_get.call_args_list],
+            [
+                BINANCE_FUNDING_ENDPOINTS[0],
+                BINANCE_FUNDING_ENDPOINTS[1],
+                BINANCE_FUNDING_ENDPOINTS[1],
+                BINANCE_FUNDING_ENDPOINTS[1],
+                BINANCE_FUNDING_ENDPOINTS[2],
+            ],
+        )
+        self.assertEqual(mock_sleep.call_args_list, [call(1), call(2)])
+        self.assertIn("invalid JSON", "\n".join(logs.output))
+
     @patch("scripts.update_data.requests.get")
     def test_request_binance_json_raises_summary_when_all_endpoints_fail(self, mock_get):
         mock_get.side_effect = [

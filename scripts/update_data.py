@@ -155,7 +155,43 @@ def _request_binance_json(
                 break
 
             response.raise_for_status()
-            return response.json()
+            try:
+                return response.json()
+            except (requests.exceptions.JSONDecodeError, ValueError) as exc:
+                body = _truncate_for_log(response.text)
+                if attempt < BINANCE_MAX_RETRIES_PER_ENDPOINT:
+                    delay = BINANCE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    LOGGER.warning(
+                        "Binance %s %s received invalid JSON from endpoint %s (%d/%d), attempt %d/%d, body=%r: %s; retrying in %ss",
+                        service,
+                        request_type,
+                        endpoint,
+                        endpoint_index,
+                        endpoint_count,
+                        attempt,
+                        BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                        body,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                LOGGER.warning(
+                    "Binance %s %s received invalid JSON from endpoint %s (%d/%d), attempt %d/%d, body=%r: %s; %s",
+                    service,
+                    request_type,
+                    endpoint,
+                    endpoint_index,
+                    endpoint_count,
+                    attempt,
+                    BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                    body,
+                    exc,
+                    "switching to next endpoint" if has_next_endpoint else "no endpoints remaining",
+                )
+                failures.append(f"{endpoint} -> invalid JSON: {body}")
+                break
 
     attempted = ", ".join(endpoints)
     failure_summary = "; ".join(failures) if failures else "no endpoint attempts were recorded"
