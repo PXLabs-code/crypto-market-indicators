@@ -32,6 +32,7 @@ jobs:
 
       - name: Run update script
         env:
+          FUNDING_FAILURE_POLICY: fail
           NON_FATAL_ISSUES_OUTPUT: ${{ runner.temp }}/non_fatal_data_update_issues.md
         run: python scripts/update_data.py
 

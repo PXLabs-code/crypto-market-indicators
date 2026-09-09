@@ -190,7 +190,7 @@ timestamp,open,high,low,close,volume
 ### `data/{asset}/funding_rates.csv`
 
 Binance USDⓈ-M 永续合约资金费率数据。
-如果 Binance 资金费率接口暂时不可用或因地域限制无法访问，更新脚本会跳过该序列，并在后续可访问时继续补齐数据。
+如果 Binance 资金费率接口暂时不可用或因地域限制无法访问，更新脚本会输出非致命问题摘要和 GitHub Actions warning 注解；当 `FUNDING_FAILURE_POLICY=fail` 时会直接失败退出。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -323,7 +323,9 @@ update_asset("sol", "SOLUSDT")
 ## 注意事项
 
 - 所有时间戳均按 UTC 处理。
-- Binance 单次请求上限为 1000 条记录；当前实现没有循环分页，首次回填很长的历史区间时可能只能获得最近或首批 1000 条数据。
+- Binance 单次请求上限为 1000 条记录；脚本会自动循环分页回填：Spot 每批 1000 条并以最后一根 K 线时间 +1 天继续，Funding 每批 1000 条并以最后一条 fundingTime +1ms 继续。
+- MVRV 会基于 Coin Metrics `next_page_token` 连续分页拉取，直到历史数据全部回填完成。
+- 首次回填会使用明确的历史起始时间（而不是依赖 API 默认“最近数据”行为）。
 - 第三方 API 暂时不可用、限流或返回不连续数据时，任务会失败且不会写入异常结果。
 - Binance 请求会记录失败端点、状态码和截断后的响应正文；如果所有候选端点都失败，脚本会以非零退出码结束，避免写入不完整数据。
 - 如果 GitHub-hosted runner 的所有 Binance 候选出口仍然受地区或合规限制影响，可考虑改用 self-hosted runner，或接入其他兼容的数据源；备用端点不能保证一定绕过这些限制。

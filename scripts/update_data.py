@@ -36,6 +36,13 @@ BINANCE_FAILOVER_STATUS_CODES = {403, 451}
 
 LOGGER = logging.getLogger(__name__)
 NON_FATAL_ISSUE_HEADER = "=== NON-FATAL DATA UPDATE ISSUES ==="
+MVRV_BOOTSTRAP_START_TIMES = {
+    "btc": pd.Timestamp("2010-01-01T00:00:00Z"),
+    "eth": pd.Timestamp("2015-07-30T00:00:00Z"),
+}
+SPOT_BOOTSTRAP_START_TIME = pd.Timestamp("2017-08-17T00:00:00Z")
+FUNDING_BOOTSTRAP_START_TIME = pd.Timestamp("2019-09-10T00:00:00Z")
+FUNDING_FAILURE_POLICY_ENV = "FUNDING_FAILURE_POLICY"
 
 
 class BinanceRequestError(RuntimeError):
@@ -313,64 +320,107 @@ def fetch_coin_metrics_mvrv(asset: str, start_time: pd.Timestamp | None) -> pd.D
     params = {"assets": asset, "metrics": "CapMVRVCur", "frequency": "1d"}
     if start_time is not None:
         params["start_time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    payload = _request_json(COIN_METRICS_URL, params)
     rows = []
-    for point in payload.get("data", []):
-        rows.append(
-            {
-                "timestamp": pd.to_datetime(point["time"], utc=True),
-                "mvrv": float(point["CapMVRVCur"]),
-            }
-        )
+    next_page_token = None
+
+    while True:
+        request_params = params.copy()
+        if next_page_token:
+            request_params["next_page_token"] = next_page_token
+
+        payload = _request_json(COIN_METRICS_URL, request_params)
+        for point in payload.get("data", []):
+            rows.append(
+                {
+                    "timestamp": pd.to_datetime(point["time"], utc=True),
+                    "mvrv": float(point["CapMVRVCur"]),
+                }
+            )
+
+        next_page_token = payload.get("next_page_token")
+        if not next_page_token:
+            break
+
     return pd.DataFrame(rows)
 
 
 def fetch_binance_spot_ohlcv(symbol: str, start_time: pd.Timestamp | None) -> pd.DataFrame:
-    params = {"symbol": symbol, "interval": "1d", "limit": 1000}
-    if start_time is not None:
-        params["startTime"] = int(start_time.timestamp() * 1000)
-
-    payload = _request_binance_json(
-        BINANCE_SPOT_ENDPOINTS,
-        params,
-        service="spot",
-        request_type="klines",
-    )
     rows = []
-    for item in payload:
-        rows.append(
-            {
-                "timestamp": pd.to_datetime(item[0], unit="ms", utc=True),
-                "open": float(item[1]),
-                "high": float(item[2]),
-                "low": float(item[3]),
-                "close": float(item[4]),
-                "volume": float(item[5]),
-            }
+    next_start_time = start_time
+
+    while True:
+        params = {"symbol": symbol, "interval": "1d", "limit": 1000}
+        if next_start_time is not None:
+            params["startTime"] = int(next_start_time.timestamp() * 1000)
+
+        payload = _request_binance_json(
+            BINANCE_SPOT_ENDPOINTS,
+            params,
+            service="spot",
+            request_type="klines",
         )
+        if not payload:
+            break
+
+        for item in payload:
+            rows.append(
+                {
+                    "timestamp": pd.to_datetime(item[0], unit="ms", utc=True),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                }
+            )
+
+        if len(payload) < 1000:
+            break
+
+        candidate_next_start = pd.to_datetime(payload[-1][0], unit="ms", utc=True) + pd.Timedelta(days=1)
+        if next_start_time is not None and candidate_next_start <= next_start_time:
+            raise ValueError("Binance spot pagination did not advance start time")
+        next_start_time = candidate_next_start
+
     return pd.DataFrame(rows)
 
 
 def fetch_binance_funding_rates(symbol: str, start_time: pd.Timestamp | None) -> pd.DataFrame:
-    params = {"symbol": symbol, "limit": 1000}
-    if start_time is not None:
-        params["startTime"] = int(start_time.timestamp() * 1000)
-
-    payload = _request_binance_json(
-        BINANCE_FUNDING_ENDPOINTS,
-        params,
-        service="futures",
-        request_type="fundingRate",
-    )
     rows = []
-    for item in payload:
-        rows.append(
-            {
-                "timestamp": pd.to_datetime(item["fundingTime"], unit="ms", utc=True),
-                "funding_rate": float(item["fundingRate"]),
-            }
+    next_start_time = start_time
+
+    while True:
+        params = {"symbol": symbol, "limit": 1000}
+        if next_start_time is not None:
+            params["startTime"] = int(next_start_time.timestamp() * 1000)
+
+        payload = _request_binance_json(
+            BINANCE_FUNDING_ENDPOINTS,
+            params,
+            service="futures",
+            request_type="fundingRate",
         )
+        if not payload:
+            break
+
+        for item in payload:
+            rows.append(
+                {
+                    "timestamp": pd.to_datetime(item["fundingTime"], unit="ms", utc=True),
+                    "funding_rate": float(item["fundingRate"]),
+                }
+            )
+
+        if len(payload) < 1000:
+            break
+
+        candidate_next_start = pd.to_datetime(payload[-1]["fundingTime"], unit="ms", utc=True) + pd.Timedelta(
+            milliseconds=1
+        )
+        if next_start_time is not None and candidate_next_start <= next_start_time:
+            raise ValueError("Binance funding-rate pagination did not advance start time")
+        next_start_time = candidate_next_start
+
     return pd.DataFrame(rows)
 
 
@@ -397,13 +447,15 @@ def update_series(
     fetch_fn,
     continuity_frequency: str,
     *,
+    bootstrap_start_time: pd.Timestamp | None = None,
     allow_stale_on_fetch_error: bool = False,
     non_fatal_issues: list[str] | None = None,
     issue_context: str | None = None,
 ) -> None:
     existing = _load_existing(path)
-    start_time = None
-    if not existing.empty:
+    if existing.empty:
+        start_time = bootstrap_start_time
+    else:
         start_time = existing["timestamp"].max() + pd.tseries.frequencies.to_offset(continuity_frequency)
 
     try:
@@ -440,21 +492,25 @@ def update_series(
 
 def update_asset(asset_code: str, symbol: str, non_fatal_issues: list[str]) -> None:
     asset_dir = DATA_ROOT / asset_code
+    mvrv_bootstrap_start = MVRV_BOOTSTRAP_START_TIMES.get(asset_code.lower())
 
     update_series(
         asset_dir / "mvrv.csv",
         lambda start: fetch_coin_metrics_mvrv(asset_code, start),
         continuity_frequency="1D",
+        bootstrap_start_time=mvrv_bootstrap_start,
     )
     update_series(
         asset_dir / "spot_ohlcv.csv",
         lambda start: fetch_binance_spot_ohlcv(symbol, start),
         continuity_frequency="1D",
+        bootstrap_start_time=SPOT_BOOTSTRAP_START_TIME,
     )
     update_series(
         asset_dir / "funding_rates.csv",
         lambda start: fetch_binance_funding_rates(symbol, start),
         continuity_frequency="8h",
+        bootstrap_start_time=FUNDING_BOOTSTRAP_START_TIME,
         allow_stale_on_fetch_error=True,
         non_fatal_issues=non_fatal_issues,
         issue_context=symbol,
@@ -486,9 +542,16 @@ def main() -> None:
     if non_fatal_issues:
         summary = render_non_fatal_issue_summary(non_fatal_issues)
         print(summary)
+        for issue in non_fatal_issues:
+            print(f"::warning title=Funding rate update issue::{issue}")
         issue_file = os.environ.get("NON_FATAL_ISSUES_OUTPUT")
         if issue_file:
             Path(issue_file).write_text(summary + "\n", encoding="utf-8")
+        if os.environ.get(FUNDING_FAILURE_POLICY_ENV, "warn").lower() == "fail":
+            raise RuntimeError(
+                f"Detected {len(non_fatal_issues)} non-fatal funding update issue(s) and "
+                f"{FUNDING_FAILURE_POLICY_ENV}=fail"
+            )
 
 
 if __name__ == "__main__":
