@@ -306,16 +306,22 @@ class UpdateDataTests(unittest.TestCase):
         self.assertIn("keeping existing data unchanged", "\n".join(logs.output))
 
     @patch("scripts.update_data._load_existing")
-    def test_update_series_raises_binance_fetch_error_when_no_existing_data(self, mock_load_existing):
+    @patch("scripts.update_data._write_if_changed")
+    def test_update_series_skips_allowed_binance_fetch_error_when_no_existing_data(
+        self, mock_write_if_changed, mock_load_existing
+    ):
         mock_load_existing.return_value = pd.DataFrame()
 
-        with self.assertRaises(BinanceRequestError):
+        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
             update_series(
                 Path("/tmp/funding_rates.csv"),
                 Mock(side_effect=BinanceRequestError("blocked")),
                 "8h",
                 allow_stale_on_fetch_error=True,
             )
+
+        mock_write_if_changed.assert_not_called()
+        self.assertIn("no existing data available yet", "\n".join(logs.output))
 
     def test_truncate_for_log_limits_body_length(self):
         truncated = _truncate_for_log("x" * 400, max_chars=20)

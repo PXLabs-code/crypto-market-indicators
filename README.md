@@ -189,6 +189,7 @@ timestamp,open,high,low,close,volume
 ### `data/{asset}/funding_rates.csv`
 
 Binance USDⓈ-M 永续合约资金费率数据。
+如果 Binance 资金费率接口暂时不可用或因地域限制无法访问，更新脚本会跳过该序列，并在后续可访问时继续补齐数据。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
