@@ -718,7 +718,7 @@ def build_price_and_equity_figure(
         subplot_titles=(
             "BTC 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
             "各策略累计净值曲线对比（初始资金 $100,000，对数坐标；默认仅显示 Buy & Hold 与最佳策略，"
-            "点击下方图例可手动勾选/取消其他策略）",
+            "点击右侧图例可手动勾选/取消其他策略）",
             "各策略动态回撤 (%) 对比",
         ),
     )
@@ -822,6 +822,10 @@ def build_price_and_equity_figure(
             dict(label=name, method="restyle", args=[{"visible": visible_list}, signal_trace_indices])
         )
 
+    # 图例固定在栏 2/3（净值 + 回撤）右侧、纵向排列，与栏 1 顶部的下拉菜单在空间上
+    # 完全分离，避免两者重叠导致互相遮挡、点击无响应。
+    row2_domain_top = fig.layout.yaxis2.domain[1]
+
     fig.update_layout(
         updatemenus=[
             dict(
@@ -835,8 +839,16 @@ def build_price_and_equity_figure(
                 showactive=True,
             )
         ],
-        legend=dict(groupclick="togglegroup", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
-        margin=dict(t=110, b=40, l=60, r=30),
+        legend=dict(
+            groupclick="togglegroup",
+            orientation="v",
+            yanchor="top",
+            y=row2_domain_top,
+            xanchor="left",
+            x=1.02,
+            title=dict(text="策略图例（点击显示/隐藏）"),
+        ),
+        margin=dict(t=110, b=40, l=60, r=260),
         height=1200,
         hovermode="x unified",
         template="plotly_white",
