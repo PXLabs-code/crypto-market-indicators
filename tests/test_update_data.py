@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import pandas as pd
@@ -14,6 +15,7 @@ from scripts.update_data import (
     fetch_binance_funding_rates,
     fetch_binance_spot_ohlcv,
     merge_deduplicate,
+    update_series,
 )
 
 
@@ -273,6 +275,47 @@ class UpdateDataTests(unittest.TestCase):
         self.assertIn(BINANCE_SPOT_ENDPOINTS[1], message)
         self.assertIn(BINANCE_SPOT_ENDPOINTS[2], message)
         self.assertIn("HTTP 451", message)
+
+    @patch("scripts.update_data._write_if_changed")
+    @patch("scripts.update_data._load_existing")
+    def test_update_series_keeps_existing_data_on_allowed_binance_fetch_error(
+        self, mock_load_existing, mock_write_if_changed
+    ):
+        existing = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-01-01T00:00:00Z", "2026-01-01T08:00:00Z"],
+                    utc=True,
+                ),
+                "funding_rate": [0.0001, 0.0002],
+            }
+        )
+        mock_load_existing.return_value = existing
+        fetch_fn = Mock(side_effect=BinanceRequestError("blocked"))
+
+        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+            update_series(
+                Path("/tmp/funding_rates.csv"),
+                fetch_fn,
+                "8h",
+                allow_stale_on_fetch_error=True,
+            )
+
+        fetch_fn.assert_called_once()
+        mock_write_if_changed.assert_not_called()
+        self.assertIn("keeping existing data unchanged", "\n".join(logs.output))
+
+    @patch("scripts.update_data._load_existing")
+    def test_update_series_raises_binance_fetch_error_when_no_existing_data(self, mock_load_existing):
+        mock_load_existing.return_value = pd.DataFrame()
+
+        with self.assertRaises(BinanceRequestError):
+            update_series(
+                Path("/tmp/funding_rates.csv"),
+                Mock(side_effect=BinanceRequestError("blocked")),
+                "8h",
+                allow_stale_on_fetch_error=True,
+            )
 
     def test_truncate_for_log_limits_body_length(self):
         truncated = _truncate_for_log("x" * 400, max_chars=20)

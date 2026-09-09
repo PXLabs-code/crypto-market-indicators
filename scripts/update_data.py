@@ -360,13 +360,24 @@ def update_series(
     path: Path,
     fetch_fn,
     continuity_frequency: str,
+    *,
+    allow_stale_on_fetch_error: bool = False,
 ) -> None:
     existing = _load_existing(path)
     start_time = None
     if not existing.empty:
         start_time = existing["timestamp"].max() + pd.tseries.frequencies.to_offset(continuity_frequency)
 
-    fetched = fetch_fn(start_time)
+    try:
+        fetched = fetch_fn(start_time)
+    except BinanceRequestError:
+        if allow_stale_on_fetch_error and not existing.empty:
+            LOGGER.warning(
+                "Skipping update for %s after Binance fetch failure; keeping existing data unchanged",
+                path,
+            )
+            return
+        raise
     if existing.empty and fetched.empty:
         raise ValueError(f"No data returned for {path}")
 
@@ -392,6 +403,7 @@ def update_asset(asset_code: str, symbol: str) -> None:
         asset_dir / "funding_rates.csv",
         lambda start: fetch_binance_funding_rates(symbol, start),
         continuity_frequency="8h",
+        allow_stale_on_fetch_error=True,
     )
 
 
