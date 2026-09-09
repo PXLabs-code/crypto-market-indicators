@@ -479,8 +479,9 @@ class FundingRateSqueezeStrategy(BaseStrategy):
 
 
 class ConsensusVotingStrategy(BaseStrategy):
-    """i) 多策略共振投票策略：统计 b)~h) 共 7 个策略当日的调仓方向作为「投票」，
-    多数一致时才满仓/清仓，其余时间维持前一日仓位不变。
+    """i) 多策略共振投票策略：统计 b) 双均线趋势、f) 动态波动率目标、g) 唐奇安通道突破
+    这 3 个策略当日的调仓方向作为「投票」，2 个及以上一致时才满仓/清仓，其余时间维持
+    前一日仓位不变。
 
     投票口径（均基于各成分策略各自的 ``generate_signals`` 输出，即 T 日收盘后
     「即将生效」的目标仓位，不做二次 shift——本策略自身的输出仍会在
@@ -488,31 +489,27 @@ class ConsensusVotingStrategy(BaseStrategy):
         - 买入信号：某成分策略当日目标仓位相较前一日提升（加仓/买入）。
         - 卖出信号：某成分策略当日目标仓位相较前一日下降（减仓/卖出）。
 
-    当买入信号数 >= 3 时全仓买入（100%）；当卖出信号数 >= 4 时全仓卖出（0%）；
+    当买入信号数 >= 2 时全仓买入（100%）；当卖出信号数 >= 2 时全仓卖出（0%）；
     两个条件都不满足的交易日维持前一日仓位（状态持续，不做换仓）。
     """
 
     name = "i) 多策略共振投票策略"
     RULES = [
-        ("b)~h) 7 个成分策略中，当日发出买入/加仓信号的数量 >= 3", "买入至 100%"),
-        ("b)~h) 7 个成分策略中，当日发出卖出/减仓信号的数量 >= 4", "卖出至 0%"),
-        ("买入信号 < 3 且卖出信号 < 4（未形成多数共振）", "维持前一日仓位不变"),
+        ("b) 双均线趋势 / f) 动态波动率目标 / g) 唐奇安通道突破 中，当日发出买入/加仓信号的数量 >= 2", "买入至 100%"),
+        ("b) 双均线趋势 / f) 动态波动率目标 / g) 唐奇安通道突破 中，当日发出卖出/减仓信号的数量 >= 2", "卖出至 0%"),
+        ("买入信号 < 2 且卖出信号 < 2（未形成多数共振）", "维持前一日仓位不变"),
     ]
 
-    BUY_VOTE_THRESHOLD = 3
-    SELL_VOTE_THRESHOLD = 4
+    BUY_VOTE_THRESHOLD = 2
+    SELL_VOTE_THRESHOLD = 2
 
     @staticmethod
     def _component_strategies() -> List[BaseStrategy]:
-        # b)~h) 共 7 个策略作为投票成分，不含 a) Buy & Hold（恒定满仓，无调仓信号可投票）。
+        # 仅取 b) / f) / g) 这 3 个趋势/波动率/突破类策略作为投票成分。
         return [
             TrendFollowingStrategy(),
-            ValuationMeanReversionStrategy(),
-            SentimentRegimeStrategy(),
-            MultiFactorScoringStrategy(),
             DynamicVolTargetingStrategy(),
             DonchianBreakoutStrategy(),
-            FundingRateSqueezeStrategy(),
         ]
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
@@ -702,9 +699,15 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r}, {g}, {b}, {alpha})"
 
 
-def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyResult]) -> go.Figure:
+def build_price_and_equity_figure(
+    df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, default_visible: Tuple[str, ...] = ()
+) -> go.Figure:
     strategy_names = list(results.keys())
     dates = df["timestamp"]
+    # 净值/回撤曲线默认只显示 Buy & Hold 基准与最佳策略，其余策略默认收起为
+    # "legendonly"（图例中可见但曲线隐藏），避免 9 条曲线一次性全部展示导致
+    # 无法看清；用户可点击图例手动勾选/取消需要对比的策略。
+    default_visible_set = set(default_visible) or {name for name in (strategy_names[0], best_name) if name}
 
     fig = make_subplots(
         rows=3,
@@ -714,7 +717,8 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
         row_heights=[0.42, 0.36, 0.22],
         subplot_titles=(
             "BTC 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
-            "各策略累计净值曲线对比（初始资金 $100,000，对数坐标，点击图例可显示/隐藏）",
+            "各策略累计净值曲线对比（初始资金 $100,000，对数坐标；默认仅显示 Buy & Hold 与最佳策略，"
+            "点击下方图例可手动勾选/取消其他策略）",
             "各策略动态回撤 (%) 对比",
         ),
     )
@@ -765,11 +769,13 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
         signal_trace_indices.append(len(fig.data) - 1)
 
     # --- 栏 2 / 栏 3：各策略净值曲线（以 $100,000 初始资金换算）与回撤曲线，
-    #     共用图例组（legendgroup）联动显隐 ---
+    #     共用图例组（legendgroup）联动显隐。默认仅 Buy & Hold + 最佳策略可见，
+    #     其余策略以 legendonly 形式收起，由用户点击图例手动选择展示对象。 ---
     for i, name in enumerate(strategy_names):
         result = results[name]
         color = PALETTE[i % len(PALETTE)]
         equity_usd = result.equity_curve * INITIAL_CAPITAL
+        initial_visibility = True if name in default_visible_set else "legendonly"
 
         fig.add_trace(
             go.Scatter(
@@ -778,6 +784,7 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
                 mode="lines",
                 name=name,
                 legendgroup=name,
+                visible=initial_visibility,
                 line=dict(color=color, width=1.8),
                 hovertemplate="%{x|%Y-%m-%d}<br>" + name + ": $%{y:,.0f}<extra></extra>",
             ),
@@ -792,6 +799,7 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
                 name=name,
                 legendgroup=name,
                 showlegend=False,
+                visible=initial_visibility,
                 line=dict(color=color, width=1.2),
                 fill="tozeroy",
                 fillcolor=_hex_to_rgba(color, 0.12),
@@ -991,7 +999,7 @@ function sortTable(colIndex) {
 
 
 def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str) -> str:
-    fig = build_price_and_equity_figure(df, results)
+    fig = build_price_and_equity_figure(df, results, best_name)
     chart_html = fig.to_html(full_html=False, include_plotlyjs=True, div_id="backtest-chart")
     table_html = build_metrics_table_html(results, best_name)
     rules_html = build_rules_html(results)
