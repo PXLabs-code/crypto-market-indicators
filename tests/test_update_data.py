@@ -378,22 +378,31 @@ class UpdateDataTests(unittest.TestCase):
         self.assertEqual(mock_request_json.call_count, 1)
 
     @patch("scripts.update_data.fetch_okx_funding_rates")
+    @patch("scripts.update_data.fetch_binance_funding_rate_archive")
     @patch("scripts.update_data.fetch_binance_funding_rates")
     def test_fetch_funding_rates_uses_okx_when_binance_is_unavailable(
-        self, mock_binance_fetch, mock_okx_fetch
+        self, mock_binance_fetch, mock_archive_fetch, mock_okx_fetch
     ):
         mock_binance_fetch.side_effect = BinanceRequestError("HTTP 451")
         mock_okx_fetch.return_value = pd.DataFrame(
             {"timestamp": pd.to_datetime(["2026-01-01T00:00:00Z"], utc=True), "funding_rate": [0.0001]}
         )
+        mock_archive_fetch.return_value = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2025-12-31T16:00:00Z"], utc=True), "funding_rate": [0.0002]}
+        )
         sources = []
+        start_time = pd.Timestamp("2025-12-01T00:00:00Z")
 
         with self.assertLogs("scripts.update_data", level="WARNING") as logs:
-            df = fetch_funding_rates("BTCUSDT", None, sources)
+            df = fetch_funding_rates("BTCUSDT", start_time, sources)
 
-        self.assertEqual(len(df), 1)
-        mock_okx_fetch.assert_called_once_with("BTCUSDT", None)
-        self.assertEqual(sources, ["BTCUSDT: OKX fallback (Binance unavailable: HTTP 451)"])
+        self.assertEqual(len(df), 2)
+        mock_okx_fetch.assert_called_once_with("BTCUSDT", start_time)
+        mock_archive_fetch.assert_called_once_with("BTCUSDT", start_time)
+        self.assertEqual(
+            sources,
+            ["BTCUSDT: OKX recent data and Binance official archive (Binance API unavailable: HTTP 451)"],
+        )
         self.assertIn("switching to OKX fallback", "\n".join(logs.output))
 
     @patch("scripts.update_data.fetch_okx_funding_rates")
@@ -406,7 +415,7 @@ class UpdateDataTests(unittest.TestCase):
             fetch_funding_rates("BTCUSDT", None, [])
 
         self.assertIn("Binance primary source failed: HTTP 451", str(context.exception))
-        self.assertIn("OKX fallback failed: service unavailable", str(context.exception))
+        self.assertIn("fallback failed: service unavailable", str(context.exception))
 
     @patch("scripts.update_data._request_json")
     def test_fetch_coin_metrics_mvrv_paginates_with_next_page_token(self, mock_request_json):
@@ -581,6 +590,41 @@ class UpdateDataTests(unittest.TestCase):
         fetch_fn.assert_called_once_with(bootstrap)
         mock_write_if_changed.assert_called_once()
         mock_load_existing.assert_called_once()
+
+    @patch("scripts.update_data._write_if_changed")
+    @patch("scripts.update_data._load_existing")
+    @patch("scripts.update_data.ensure_strict_continuity")
+    def test_update_series_restarts_at_backfill_start_when_existing_history_is_incomplete(
+        self, mock_ensure_continuity, mock_load_existing, mock_write_if_changed
+    ):
+        mock_load_existing.return_value = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-08T08:00:00Z"], utc=True),
+                "funding_rate": [0.0001],
+            }
+        )
+        backfill_start = pd.Timestamp("2020-01-01T00:00:00Z")
+        fetch_fn = Mock(
+            return_value=pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(
+                        ["2020-01-01T00:00:00Z", "2026-06-08T08:00:00Z"], utc=True
+                    ),
+                    "funding_rate": [0.0002, 0.0001],
+                }
+            )
+        )
+
+        update_series(
+            Path("data/btc/funding_rates.csv"),
+            fetch_fn,
+            "8h",
+            bootstrap_start_time=backfill_start,
+            backfill_start_time=backfill_start,
+        )
+
+        fetch_fn.assert_called_once_with(backfill_start)
+        mock_write_if_changed.assert_called_once()
 
     @patch("scripts.update_data.update_fear_and_greed")
     @patch("scripts.update_data.update_asset")
