@@ -2,7 +2,7 @@
 
 读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（BTC 现货 OHLCV、
 BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，
-对 8 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
+对 9 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
 以及 Markdown 绩效对比表。
 
 设计原则：
@@ -47,6 +47,8 @@ VOLATILITY_WINDOW = 20
 DONCHIAN_SHORT_WINDOW = 20  # 唐奇安短通道（海龟交易法则的入场系统）
 DONCHIAN_LONG_WINDOW = 55  # 唐奇安长通道（海龟交易法则的出场/趋势确认系统）
 FUNDING_MA_WINDOW = 7  # 资金费率平滑窗口，过滤单日噪音
+INITIAL_CAPITAL = 100_000.0  # 净值曲线展示用的假设初始本金（美元）
+BULL_REGIME_FLOOR = 0.5  # 长期均线上方（确认牛市）时，逆势/防御类策略的最低仓位保护
 
 # 分级仓位网格：所有策略最终仓位都会被吸附到这 5 档上
 POSITION_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -62,6 +64,16 @@ def snap_to_grid(series: pd.Series, grid: List[float] = POSITION_GRID) -> pd.Ser
     snapped = grid_arr[idx]
     snapped[nan_mask] = np.nan
     return pd.Series(snapped, index=series.index, name=series.name)
+
+
+def apply_bull_floor(position: pd.Series, df: pd.DataFrame, floor: float = BULL_REGIME_FLOOR) -> pd.Series:
+    """牛市仓位保护：当收盘价位于长期均线（MA200）上方（确认长期上升趋势）时，
+    为逆势/防御类策略设置仓位下限，避免情绪或估值指标长期停留在极端区间导致
+    策略在多年牛市中持续低仓/空仓，白白错过趋势收益。仅在确认牛市时生效，
+    熊市/震荡市中策略仍可按原逻辑降至 0% 仓位以控制回撤。"""
+    bull_regime = df["btc_close"] > df["ma_long"]
+    floored = position.where(~(bull_regime & (position < floor)), floor)
+    return snap_to_grid(floored)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,7 @@ class ValuationMeanReversionStrategy(BaseStrategy):
         ("30% < 分位数 <= 70%（估值中性）", "维持/回到 50%"),
         ("70% < 分位数 <= 90%", "减仓至 25%"),
         ("分位数 > 90%（历史级高估）", "清仓至 0%"),
+        ("牛市保护：收盘价 > MA200（确认长期上升趋势）", "仓位下限提升至 50%，避免高估值区间长期空仓错过牛市"),
     ]
 
     # (分位数上限, 仓位) —— 分位数从低到高分级
@@ -248,7 +261,7 @@ class ValuationMeanReversionStrategy(BaseStrategy):
         position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
         for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
             position[percentile <= threshold] = weight
-        return position
+        return apply_bull_floor(position, df)
 
 
 class SentimentRegimeStrategy(BaseStrategy):
@@ -265,6 +278,7 @@ class SentimentRegimeStrategy(BaseStrategy):
         ("40 < FGI <= 60（中性）", "维持/回到 50%"),
         ("60 < FGI <= 80（贪婪）", "减仓至 25%"),
         ("FGI > 80（极度贪婪）", "逆势卖出至 0%"),
+        ("牛市保护：收盘价 > MA200（确认长期上升趋势）", "仓位下限提升至 50%，避免长期处于极度贪婪区间被反复清仓"),
     ]
 
     # (FGI 上限, 仓位) —— FGI 从低（恐惧）到高（贪婪）分级
@@ -276,7 +290,7 @@ class SentimentRegimeStrategy(BaseStrategy):
         position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
         for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
             position[fgi <= threshold] = weight
-        return position
+        return apply_bull_floor(position, df)
 
 
 # --- 多因子综合打分（供 e 与 f 两个策略共用）---------------------------------
@@ -336,15 +350,17 @@ class MultiFactorScoringStrategy(BaseStrategy):
 
     name = "e) 多因子加权打分策略"
     RULES = [
-        ("综合得分 >= 80（强烈看多）", "买入至 100%"),
-        ("65 <= 得分 < 80", "加仓至 75%"),
-        ("45 <= 得分 < 65（中性）", "维持/回到 50%"),
-        ("30 <= 得分 < 45", "减仓至 25%"),
-        ("得分 < 30（强烈看空）", "清仓至 0%"),
+        ("综合得分 >= 75（看多）", "买入至 100%"),
+        ("60 <= 得分 < 75", "加仓至 75%"),
+        ("40 <= 得分 < 60（中性）", "维持/回到 50%"),
+        ("25 <= 得分 < 40", "减仓至 25%"),
+        ("得分 < 25（强烈看空）", "清仓至 0%"),
     ]
 
-    SCORE_THRESHOLDS = [(80, 1.0), (65, 0.75), (45, 0.5), (30, 0.25)]
-    FLOOR_WEIGHT = 0.0  # 综合分 < 30 时清仓
+    # 相较初版下调各档阈值，让策略在牛市中更容易触及/停留在满仓，
+    # 减少因打分保守而系统性跑输 Buy & Hold 的问题。
+    SCORE_THRESHOLDS = [(75, 1.0), (60, 0.75), (40, 0.5), (25, 0.25)]
+    FLOOR_WEIGHT = 0.25  # 综合分 < 25 时仅降至 25%（保留底仓），不再完全清仓
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         score = compute_composite_score(df)
@@ -366,13 +382,16 @@ class DynamicVolTargetingStrategy(BaseStrategy):
     name = "f) 动态波动率目标策略"
     RULES = [
         ("基础方向仓位 = 综合得分 / 100（同 e 策略打分逻辑）", "0%~100% 连续值"),
-        ("已实现波动率（20 日年化）高于目标波动率 50%", "风险系数 < 1，仓位相应收缩"),
-        ("已实现波动率低于目标波动率 50%", "风险系数 > 1（上限 1.5 倍），仓位适度放大"),
+        ("已实现波动率（20 日年化）高于目标波动率 70%", "风险系数 < 1，仓位相应收缩"),
+        ("已实现波动率低于目标波动率 70%", "风险系数 > 1（上限 1.75 倍），仓位适度放大"),
         ("最终仓位 = clip(基础仓位 x 风险系数, 0, 1)", "就近吸附至 0/25/50/75/100%"),
     ]
 
-    TARGET_ANNUAL_VOL = 0.5  # 目标年化波动率 50%，作为风险预算基准
-    RISK_SCALE_MIN, RISK_SCALE_MAX = 0.2, 1.5
+    # 加密资产年化波动率长期高于 50%，原目标值会让风险系数长期 < 1，
+    # 系统性压低仓位；上调目标波动率与放大上限，让策略在低波动的牛市阶段
+    # 更充分地享受趋势收益，同时仍保留高波动期间的降仓保护。
+    TARGET_ANNUAL_VOL = 0.7  # 目标年化波动率 70%，作为风险预算基准
+    RISK_SCALE_MIN, RISK_SCALE_MAX = 0.3, 1.75
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         base_position = compute_composite_score(df) / 100.0
@@ -398,12 +417,14 @@ class DonchianBreakoutStrategy(BaseStrategy):
     RULES = [
         ("收盘价突破过去 55 日最高价（长通道上轨，强势新高确认）", "买入至 100%"),
         ("收盘价突破过去 20 日最高价，但未突破 55 日最高价（短通道上轨）", "加仓至 75%"),
-        ("价格位于 20 日与 55 日通道内部（无突破，趋势未明）", "维持/回到 50%"),
+        ("价格位于 20 日与 55 日通道内部（无突破，趋势未明）", "维持/回到 75%（默认偏多，避免长期盘整错失趋势）"),
         ("收盘价跌破过去 20 日最低价，但未跌破 55 日最低价（短通道下轨）", "减仓至 25%"),
         ("收盘价跌破过去 55 日最低价（长通道下轨，强势新低确认）", "清仓至 0%"),
     ]
 
-    NEUTRAL_WEIGHT = 0.5
+    # 通道内部（无突破）在长期牛市中经常出现（价格沿上轨附近盘整），
+    # 将默认仓位由 50% 上调至 75%，减少策略在牛市盘整期被动降仓的损耗。
+    NEUTRAL_WEIGHT = 0.75
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         close = df["btc_close"]
@@ -442,6 +463,7 @@ class FundingRateSqueezeStrategy(BaseStrategy):
         ("-0.01% < 7 日均资金费率 <= 0.03%（中性）", "维持/回到 50%"),
         ("0.03% < 7 日均资金费率 <= 0.07%（多头杠杆升温）", "减仓至 25%"),
         ("7 日均资金费率 > 0.07%（多头严重拥挤，潜在多杀多风险）", "逆势卖出至 0%"),
+        ("牛市保护：收盘价 > MA200（确认长期上升趋势）", "仓位下限提升至 50%，避免长期牛市中因资金费率偏高被反复减仓"),
     ]
 
     # (7 日均资金费率上限, 仓位) —— 费率从低（空头拥挤）到高（多头拥挤）分级
@@ -453,7 +475,61 @@ class FundingRateSqueezeStrategy(BaseStrategy):
         position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
         for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
             position[funding_ma <= threshold] = weight
-        return position
+        return apply_bull_floor(position, df)
+
+
+class ConsensusVotingStrategy(BaseStrategy):
+    """i) 多策略共振投票策略：统计 b)~h) 共 7 个策略当日的调仓方向作为「投票」，
+    多数一致时才满仓/清仓，其余时间维持前一日仓位不变。
+
+    投票口径（均基于各成分策略各自的 ``generate_signals`` 输出，即 T 日收盘后
+    「即将生效」的目标仓位，不做二次 shift——本策略自身的输出仍会在
+    ``BacktestEngine.run()`` 中统一 shift(1) 防未来函数）：
+        - 买入信号：某成分策略当日目标仓位相较前一日提升（加仓/买入）。
+        - 卖出信号：某成分策略当日目标仓位相较前一日下降（减仓/卖出）。
+
+    当买入信号数 >= 3 时全仓买入（100%）；当卖出信号数 >= 4 时全仓卖出（0%）；
+    两个条件都不满足的交易日维持前一日仓位（状态持续，不做换仓）。
+    """
+
+    name = "i) 多策略共振投票策略"
+    RULES = [
+        ("b)~h) 7 个成分策略中，当日发出买入/加仓信号的数量 >= 3", "买入至 100%"),
+        ("b)~h) 7 个成分策略中，当日发出卖出/减仓信号的数量 >= 4", "卖出至 0%"),
+        ("买入信号 < 3 且卖出信号 < 4（未形成多数共振）", "维持前一日仓位不变"),
+    ]
+
+    BUY_VOTE_THRESHOLD = 3
+    SELL_VOTE_THRESHOLD = 4
+
+    @staticmethod
+    def _component_strategies() -> List[BaseStrategy]:
+        # b)~h) 共 7 个策略作为投票成分，不含 a) Buy & Hold（恒定满仓，无调仓信号可投票）。
+        return [
+            TrendFollowingStrategy(),
+            ValuationMeanReversionStrategy(),
+            SentimentRegimeStrategy(),
+            MultiFactorScoringStrategy(),
+            DynamicVolTargetingStrategy(),
+            DonchianBreakoutStrategy(),
+            FundingRateSqueezeStrategy(),
+        ]
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        buy_votes = pd.Series(0, index=df.index, dtype=int)
+        sell_votes = pd.Series(0, index=df.index, dtype=int)
+
+        for component in self._component_strategies():
+            component_position = snap_to_grid(component.generate_signals(df).clip(0.0, 1.0))
+            change = component_position.diff()
+            buy_votes = buy_votes.add((change > 1e-9).astype(int), fill_value=0)
+            sell_votes = sell_votes.add((change < -1e-9).astype(int), fill_value=0)
+
+        position = pd.Series(np.nan, index=df.index, name="position")
+        position[buy_votes >= self.BUY_VOTE_THRESHOLD] = 1.0
+        position[sell_votes >= self.SELL_VOTE_THRESHOLD] = 0.0
+        # 未触发共振阈值的交易日维持前一日仓位（状态持续）；起点视为空仓。
+        return position.ffill().fillna(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +581,7 @@ def compute_metrics(result: "StrategyResult") -> dict:
     return {
         "cumulative_return_pct": cumulative_return_pct,
         "annualized_return_pct": ann_return * 100,
+        "final_equity_usd": equity.iloc[-1] * INITIAL_CAPITAL,
         "mdd_pct": mdd_pct,
         "sharpe_ratio": sharpe,
         "calmar_ratio": calmar,
@@ -615,6 +692,7 @@ PALETTE = [
     "#8c564b",  # 棕
     "#e377c2",  # 粉
     "#17becf",  # 青
+    "#bcbd22",  # 橄榄黄
 ]
 
 
@@ -636,7 +714,7 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
         row_heights=[0.42, 0.36, 0.22],
         subplot_titles=(
             "BTC 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
-            "各策略累计净值曲线对比（对数坐标，点击图例可显示/隐藏）",
+            "各策略累计净值曲线对比（初始资金 $100,000，对数坐标，点击图例可显示/隐藏）",
             "各策略动态回撤 (%) 对比",
         ),
     )
@@ -686,19 +764,22 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
         )
         signal_trace_indices.append(len(fig.data) - 1)
 
-    # --- 栏 2 / 栏 3：各策略净值曲线与回撤曲线，共用图例组（legendgroup）联动显隐 ---
+    # --- 栏 2 / 栏 3：各策略净值曲线（以 $100,000 初始资金换算）与回撤曲线，
+    #     共用图例组（legendgroup）联动显隐 ---
     for i, name in enumerate(strategy_names):
         result = results[name]
         color = PALETTE[i % len(PALETTE)]
+        equity_usd = result.equity_curve * INITIAL_CAPITAL
 
         fig.add_trace(
             go.Scatter(
                 x=dates,
-                y=result.equity_curve,
+                y=equity_usd,
                 mode="lines",
                 name=name,
                 legendgroup=name,
                 line=dict(color=color, width=1.8),
+                hovertemplate="%{x|%Y-%m-%d}<br>" + name + ": $%{y:,.0f}<extra></extra>",
             ),
             row=2,
             col=1,
@@ -720,7 +801,7 @@ def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyR
         )
 
     fig.update_yaxes(type="log", title_text="BTC 价格 (USDT, 对数坐标)", row=1, col=1)
-    fig.update_yaxes(type="log", title_text="策略净值 (对数坐标)", row=2, col=1)
+    fig.update_yaxes(type="log", title_text="策略净值 (USD, 初始资金 $100,000, 对数坐标)", row=2, col=1)
     fig.update_yaxes(title_text="回撤 (%)", row=3, col=1)
 
     # 下拉菜单：一次只让一个策略的买卖信号在栏 1 中可见
@@ -762,10 +843,17 @@ def _fmt(value, digits: int = 2, suffix: str = "") -> str:
     return f"{value:.{digits}f}{suffix}"
 
 
+def _fmt_usd(value) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "N/A"
+    return f"${value:,.0f}"
+
+
 def build_metrics_table_html(results: dict[str, StrategyResult], best_name: str) -> str:
     """生成可点击表头排序的绩效对比表（原生 HTML + 内联 JS，自包含无外部依赖）。"""
     headers = [
         ("策略", "text"),
+        ("期末净值 (10万起投)", "num"),
         ("累计收益率 (%)", "num"),
         ("年化收益率 (%)", "num"),
         ("最大回撤 MDD (%)", "num"),
@@ -791,6 +879,7 @@ def build_metrics_table_html(results: dict[str, StrategyResult], best_name: str)
         signal_text = f"{signal['next_position']:.0%}（{signal['action']}）"
         cells = [
             escape(name) + marker,
+            _fmt_usd(m["final_equity_usd"]),
             _fmt(m["cumulative_return_pct"]),
             _fmt(m["annualized_return_pct"]),
             _fmt(m["mdd_pct"]),
@@ -886,8 +975,8 @@ function sortTable(colIndex) {
     let a = rowA.cells[colIndex].innerText.trim();
     let b = rowB.cells[colIndex].innerText.trim();
     if (dtype === 'num') {
-      a = parseFloat(a.replace('%', '').replace('N/A', '-Infinity'));
-      b = parseFloat(b.replace('%', '').replace('N/A', '-Infinity'));
+      a = parseFloat(a.replace(/[%$,]/g, '').replace('N/A', '-Infinity'));
+      b = parseFloat(b.replace(/[%$,]/g, '').replace('N/A', '-Infinity'));
       if (isNaN(a)) a = -Infinity;
       if (isNaN(b)) b = -Infinity;
       return currentDir === 'asc' ? a - b : b - a;
@@ -940,17 +1029,20 @@ def build_dashboard(df: pd.DataFrame, results: dict[str, StrategyResult], best_n
 
 def build_markdown_report(results: dict[str, StrategyResult], best_name: str) -> str:
     lines = ["## 加密货币多因子量化策略回测报告", ""]
+    lines.append(f"（假设初始资金 ${INITIAL_CAPITAL:,.0f}，按各策略净值曲线折算「期末净值」一列）")
+    lines.append("")
 
     lines.append(
-        "| 策略 | 累计收益率 (%) | 年化收益率 (%) | 最大回撤 MDD (%) | 夏普比率 | 卡玛比率 | 胜率 (%) | 盈亏比 | 调仓次数 |"
+        "| 策略 | 期末净值 ($) | 累计收益率 (%) | 年化收益率 (%) | 最大回撤 MDD (%) | 夏普比率 | 卡玛比率 | 胜率 (%) | 盈亏比 | 调仓次数 |"
     )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
     for name, result in results.items():
         m = result.metrics
         marker = " ⭐" if name == best_name else ""
         lines.append(
-            f"| {name}{marker} | {_fmt(m['cumulative_return_pct'])} | {_fmt(m['annualized_return_pct'])} | "
+            f"| {name}{marker} | {_fmt_usd(m['final_equity_usd'])} | {_fmt(m['cumulative_return_pct'])} | "
+            f"{_fmt(m['annualized_return_pct'])} | "
             f"{_fmt(m['mdd_pct'])} | {_fmt(m['sharpe_ratio'])} | {_fmt(m['calmar_ratio'])} | "
             f"{_fmt(m['win_rate_pct'])} | {_fmt(m['profit_loss_ratio'])} | {m['trade_count']} |"
         )
@@ -1002,6 +1094,7 @@ def build_strategies() -> List[BaseStrategy]:
         DynamicVolTargetingStrategy(),
         DonchianBreakoutStrategy(),
         FundingRateSqueezeStrategy(),
+        ConsensusVotingStrategy(),
     ]
 
 
@@ -1027,12 +1120,11 @@ def main() -> None:
     build_dashboard(df, results, best_name, dashboard_path)
 
     report_markdown = build_markdown_report(results, best_name)
-    summary_path = args.reports_dir / "performance_summary.md"
-    summary_path.write_text(report_markdown, encoding="utf-8")
 
+    # 仅打印到 stdout（供 CI 捕获后写入 $GITHUB_STEP_SUMMARY），不再落盘为
+    # reports/performance_summary.md —— reports/ 目录只产出 backtest_dashboard.html。
     print(report_markdown)
-    print(f"交互式看板已保存至: {dashboard_path}")
-    print(f"Markdown 报告已保存至: {summary_path}")
+    print(f"交互式看板已保存至: {dashboard_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -32,13 +32,13 @@ jobs:
           fi
 
       - name: Run backtest
-        run: python scripts/backtest.py
+        run: python scripts/backtest.py > backtest_summary.md
 
       - name: Publish performance summary
         if: always()
         run: |
-          if [ -f reports/performance_summary.md ]; then
-            cat reports/performance_summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f backtest_summary.md ]; then
+            cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ -f reports/backtest_dashboard.html ]; then
@@ -47,6 +47,8 @@ jobs:
               echo "> 📊 完整交互式看板（可切换策略买卖信号、排序绩效表格、显隐净值/回撤曲线）请在本次运行的 **Artifacts** 中下载 \`backtest-reports\` 并打开 \`backtest_dashboard.html\` 查看。"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+          rm -f backtest_summary.md
 
       - name: Upload reports artifact
         if: always()
