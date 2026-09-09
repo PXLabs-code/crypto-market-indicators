@@ -371,11 +371,17 @@ def update_series(
     try:
         fetched = fetch_fn(start_time)
     except BinanceRequestError:
-        if allow_stale_on_fetch_error and not existing.empty:
-            LOGGER.warning(
-                "Skipping update for %s after Binance fetch failure; keeping existing data unchanged",
-                path,
-            )
+        if allow_stale_on_fetch_error:
+            if existing.empty:
+                LOGGER.warning(
+                    "Skipping update for %s after Binance fetch failure; no existing data available yet",
+                    path,
+                )
+            else:
+                LOGGER.warning(
+                    "Skipping update for %s after Binance fetch failure; keeping existing data unchanged",
+                    path,
+                )
             return
         raise
     if existing.empty and fetched.empty:
