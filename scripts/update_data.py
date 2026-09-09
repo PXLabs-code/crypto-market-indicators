@@ -20,6 +20,10 @@ BINANCE_FUNDING_ENDPOINTS = (
     "https://fapi2.binance.com/fapi/v1/fundingRate",
 )
 FNG_URL = "https://api.alternative.me/fng/"
+FNG_KNOWN_MISSING_TIMESTAMPS = tuple(
+    pd.Timestamp(day, tz="UTC")
+    for day in ("2018-04-14", "2018-04-15", "2018-04-16", "2024-10-26")
+)
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 REQUEST_TIMEOUT_SECONDS = 30
@@ -217,7 +221,13 @@ def _validate_values(df: pd.DataFrame, timestamp_col: str) -> None:
         raise ValueError("Detected missing or invalid values in dataset")
 
 
-def ensure_strict_continuity(df: pd.DataFrame, timestamp_col: str, frequency: str) -> None:
+def ensure_strict_continuity(
+    df: pd.DataFrame,
+    timestamp_col: str,
+    frequency: str,
+    *,
+    allowed_missing_timestamps: Sequence[pd.Timestamp] = (),
+) -> None:
     if df.empty:
         return
 
@@ -234,9 +244,17 @@ def ensure_strict_continuity(df: pd.DataFrame, timestamp_col: str, frequency: st
         tz="UTC",
     )
     actual = pd.DatetimeIndex(df[timestamp_col])
+    allowed_gaps = expected.difference(actual).intersection(allowed_missing_timestamps)
+    expected = expected.difference(allowed_gaps)
 
     if len(expected) != len(actual) or not actual.equals(expected):
         raise ValueError("Detected data gaps; refusing to write corrupted data")
+
+    if not allowed_gaps.empty:
+        LOGGER.warning(
+            "Source history omits known timestamps: %s; preserving observed data without filling gaps",
+            ", ".join(timestamp.isoformat() for timestamp in allowed_gaps),
+        )
 
 
 def merge_deduplicate(existing: pd.DataFrame, new_data: pd.DataFrame) -> pd.DataFrame:
@@ -421,7 +439,12 @@ def update_fear_and_greed() -> None:
         raise ValueError("No data returned for fear and greed index")
 
     merged = merge_deduplicate(existing, fetched)
-    ensure_strict_continuity(merged, "timestamp", "1D")
+    ensure_strict_continuity(
+        merged,
+        "timestamp",
+        "1D",
+        allowed_missing_timestamps=FNG_KNOWN_MISSING_TIMESTAMPS,
+    )
     _write_if_changed(path, merged)
 
 

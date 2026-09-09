@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
 
 import pandas as pd
@@ -9,12 +10,14 @@ from scripts.update_data import (
     BINANCE_FUNDING_ENDPOINTS,
     BINANCE_SPOT_ENDPOINTS,
     BinanceRequestError,
+    FNG_KNOWN_MISSING_TIMESTAMPS,
     _request_binance_json,
     _truncate_for_log,
     ensure_strict_continuity,
     fetch_binance_funding_rates,
     fetch_binance_spot_ohlcv,
     merge_deduplicate,
+    update_fear_and_greed,
     update_series,
 )
 
@@ -101,6 +104,86 @@ class UpdateDataTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             ensure_strict_continuity(df, "timestamp", "1D")
+
+    @staticmethod
+    def _fear_greed_history(start, end, missing=()):
+        timestamps = pd.date_range(start, end, freq="1D", tz="UTC")
+        timestamps = timestamps.difference(pd.to_datetime(list(missing), utc=True))
+        return pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "fear_greed_value": 30,
+                "classification": "Fear",
+            }
+        )
+
+    @patch("scripts.update_data.fetch_fear_and_greed")
+    def test_fear_greed_bootstrap_preserves_known_gaps_and_accepts_backfill(self, mock_fetch):
+        cases = (
+            ("2018-04-13", "2018-04-17", ["2018-04-14", "2018-04-15", "2018-04-16"]),
+            ("2024-10-25", "2024-10-27", ["2024-10-26"]),
+        )
+        for start, end, missing in cases:
+            with self.subTest(missing=missing), TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "market" / "fear_greed.csv"
+                observed = self._fear_greed_history(start, end, missing)
+                mock_fetch.return_value = observed
+                with patch("scripts.update_data.DATA_ROOT", root):
+                    with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+                        update_fear_and_greed()
+                    saved = pd.read_csv(path)
+                    self.assertEqual(len(saved), len(observed))
+                    self.assertEqual(
+                        saved["timestamp"].tolist(),
+                        observed["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
+                    )
+                    for day in missing:
+                        self.assertIn(day, "\n".join(logs.output))
+
+                    with self.assertLogs("scripts.update_data", level="WARNING"):
+                        update_fear_and_greed()
+                    pd.testing.assert_frame_equal(saved, pd.read_csv(path))
+
+                    mock_fetch.return_value = self._fear_greed_history(start, end)
+                    with self.assertNoLogs("scripts.update_data", level="WARNING"):
+                        update_fear_and_greed()
+                    self.assertEqual(len(pd.read_csv(path)), len(mock_fetch.return_value))
+
+    @patch("scripts.update_data._write_if_changed")
+    @patch("scripts.update_data._load_existing", return_value=pd.DataFrame())
+    @patch("scripts.update_data.fetch_fear_and_greed")
+    def test_fear_greed_rejects_unexpected_gaps_and_invalid_data(
+        self, mock_fetch, mock_load, mock_write
+    ):
+        known_gap = self._fear_greed_history("2024-10-25", "2024-10-28", ["2024-10-26"])
+        unexpected_gap = known_gap.iloc[[0, 2]].copy()
+        invalid_value = known_gap.copy()
+        invalid_value.loc[0, "classification"] = None
+        invalid_timestamp = known_gap.copy()
+        invalid_timestamp.loc[0, "timestamp"] = pd.NaT
+        off_grid = known_gap.copy()
+        off_grid.loc[1, "timestamp"] += pd.Timedelta(hours=1)
+        for data in (unexpected_gap, invalid_value, invalid_timestamp, off_grid, pd.DataFrame()):
+            with self.subTest(data=data):
+                mock_fetch.return_value = data
+                with self.assertRaises(ValueError):
+                    update_fear_and_greed()
+                mock_write.assert_not_called()
+
+    def test_known_fear_greed_gaps_remain_errors_for_other_series(self):
+        data = self._fear_greed_history("2024-10-25", "2024-10-27", ["2024-10-26"])
+        with self.assertRaises(ValueError):
+            ensure_strict_continuity(data, "timestamp", "1D")
+
+    def test_known_gap_exceptions_do_not_allow_duplicate_timestamps(self):
+        data = self._fear_greed_history("2024-10-25", "2024-10-27", ["2024-10-26"])
+        data = pd.concat([data, data.iloc[[0]]], ignore_index=True)
+        with self.assertRaises(ValueError):
+            ensure_strict_continuity(
+                data, "timestamp", "1D",
+                allowed_missing_timestamps=FNG_KNOWN_MISSING_TIMESTAMPS,
+            )
 
     @patch("scripts.update_data.time.sleep")
     @patch("scripts.update_data.requests.get")

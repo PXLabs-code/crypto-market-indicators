@@ -47,6 +47,7 @@
 5. 仅在数据发生变化时写入 CSV。
 
 如果检测到数据断层、缺失时间戳或空值，脚本会抛出异常并拒绝写入，避免损坏已有数据。
+Fear & Greed Index 仅对下文列出的已知上游历史缺日作例外；其他数据集仍执行严格连续性校验。
 
 对于 Binance 数据，请求会优先使用公开的 market-data-only 现货端点，并为 Spot / Futures 配置有限候选端点、有限次数重试和指数退避。若遇到 HTTP 403/451 等访问限制，会尽快切换到下一个候选端点；若遇到 HTTP 429、5xx、超时或连接异常，则会在上限内重试并记录可诊断日志。
 
@@ -206,6 +207,10 @@ timestamp,funding_rate
 ### `data/market/fear_greed.csv`
 
 Alternative.me Crypto Fear & Greed Index 数据。
+
+上游完整历史存在已知缺日：`2018-04-14`、`2018-04-15`、`2018-04-16` 和 `2024-10-26`（参见[公开采集记录](https://github.com/jungmin127/study/blob/f685267e772b6d95453b4dbbbd9632acc3079924/260711-upbit-v1/external_data_service.py#L26-L44)及 [2024-10-26 缺日的独立记录](https://github.com/cancleeric/trustforge/blob/6db496cc8b4b7fe2a5e09d8a003c715365441693/docs/qa/HERMES-FIVE-YEAR-BACKFILL-STARTED-2026-07-17.md#L5-L18)）。
+校验仅允许这些日期缺失并记录警告，不插值、不前向填充、不生成虚构数据；若上游补回这些日期，会正常合并。
+其他缺日、异常时间戳和空值仍会导致更新失败，并保留已有 CSV。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
