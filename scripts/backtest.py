@@ -1,9 +1,10 @@
 """加密货币多因子量化策略回测与可视化系统。
 
-读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（BTC 现货 OHLCV、
-BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，
-对 9 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
-以及 Markdown 绩效对比表。
+读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（现货 OHLCV、
+MVRV、资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，对 8 套仓位
+策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板以及
+Markdown 绩效对比表。默认对 BTC 与 ETH 分别独立运行同一套策略/规则，各自输出
+一份看板与报告（``--assets`` 可指定其他 ``data/<asset>/`` 子目录）。
 
 设计原则：
     - 严禁未来函数：所有需要 T+1 日才能知道的仓位一律 ``.shift(1)`` 后再参与收益计算。
@@ -13,6 +14,7 @@ BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一�
     - 每个策略都在 ``RULES`` 类属性中显式声明「触发条件 -> 目标仓位」的对照表，
       供 Markdown 报告与 HTML 看板自动生成规则说明。
 """
+
 
 from __future__ import annotations
 
@@ -90,32 +92,40 @@ def _read_csv(path: Path, columns: List[str]) -> pd.DataFrame:
     return df[columns]
 
 
-def load_dataset(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    """加载并对齐全部数据源，返回以 BTC 现货价格日期为主轴的日频面板数据。
+def load_dataset(data_dir: Path = DATA_DIR, asset: str = "btc") -> pd.DataFrame:
+    """加载并对齐指定资产（``asset``，如 "btc"/"eth"）的全部数据源，返回以该资产
+    现货价格日期为主轴的日频面板数据。
 
     对齐规则：
         - 资金费率（8 小时频率）先按 UTC 自然日聚合取均值，再并入主表。
-        - 所有数据以 BTC 现货价格的 ``timestamp`` 为主轴做左外连接（left join）。
+        - 所有数据以该资产现货价格的 ``timestamp`` 为主轴做左外连接（left join）。
         - 缺失值只允许使用前向填充 ``ffill``，严禁使用 ``bfill``，防止未来数据泄露。
+
+    注：为保持策略实现与内部列名跨资产完全一致（与 BTC 版本同一套代码/规则），
+    价格与收益等内部列统一沿用 ``btc_*`` 命名（历史遗留自 BTC-only 版本），
+    在加载 ETH 等其他资产时这些列实际承载的是该资产自身的数据，仅为内部实现
+    细节，不影响对外输出（看板/报告标题会显示正确的资产名称）。
     """
-    btc_price = _read_csv(data_dir / "btc" / "spot_ohlcv.csv", ["timestamp", "open", "high", "low", "close", "volume"])
-    btc_mvrv = _read_csv(data_dir / "btc" / "mvrv.csv", ["timestamp", "mvrv"])
-    btc_funding = _read_csv(data_dir / "btc" / "funding_rates.csv", ["timestamp", "funding_rate"])
+    asset_price = _read_csv(
+        data_dir / asset / "spot_ohlcv.csv", ["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    asset_mvrv = _read_csv(data_dir / asset / "mvrv.csv", ["timestamp", "mvrv"])
+    asset_funding = _read_csv(data_dir / asset / "funding_rates.csv", ["timestamp", "funding_rate"])
     fgi = _read_csv(data_dir / "market" / "fear_greed.csv", ["timestamp", "fear_greed_value"])
 
     # 资金费率按 UTC 日度聚合取均值（8 小时结算 -> 每日 3 条取均值）
     funding_daily = (
-        btc_funding.groupby(btc_funding["timestamp"].dt.floor("D"))["funding_rate"]
+        asset_funding.groupby(asset_funding["timestamp"].dt.floor("D"))["funding_rate"]
         .mean()
         .reset_index()
     )
 
-    df = btc_price.sort_values("timestamp").rename(
+    df = asset_price.sort_values("timestamp").rename(
         columns={"open": "btc_open", "high": "btc_high", "low": "btc_low", "close": "btc_close", "volume": "btc_volume"}
     )
 
-    # 全部以 BTC 价格日期为主轴左连接，绝不使用其他 join 方式引入未来行
-    df = df.merge(btc_mvrv, on="timestamp", how="left")
+    # 全部以资产价格日期为主轴左连接，绝不使用其他 join 方式引入未来行
+    df = df.merge(asset_mvrv, on="timestamp", how="left")
     df = df.merge(funding_daily, on="timestamp", how="left")
     df = df.merge(fgi, on="timestamp", how="left")
 
@@ -656,7 +666,11 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
 
 
 def build_price_and_equity_figure(
-    df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, default_visible: Tuple[str, ...] = ()
+    df: pd.DataFrame,
+    results: dict[str, StrategyResult],
+    best_name: str,
+    default_visible: Tuple[str, ...] = (),
+    asset_label: str = "BTC",
 ) -> go.Figure:
     strategy_names = list(results.keys())
     dates = df["timestamp"]
@@ -672,16 +686,18 @@ def build_price_and_equity_figure(
         vertical_spacing=0.06,
         row_heights=[0.42, 0.36, 0.22],
         subplot_titles=(
-            "BTC 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
+            f"{asset_label} 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
             "各策略累计净值曲线对比（初始资金 $100,000，对数坐标；默认仅显示 Buy & Hold 与最佳策略，"
             "点击右侧图例可手动勾选/取消其他策略）",
             "各策略动态回撤 (%) 对比",
         ),
     )
 
-    # --- 栏 1：BTC 价格 + 各策略买卖点（默认仅显示第一个策略，可通过下拉菜单切换）---
+    # --- 栏 1：资产价格 + 各策略买卖点（默认仅显示第一个策略，可通过下拉菜单切换）---
     fig.add_trace(
-        go.Scatter(x=dates, y=df["btc_close"], mode="lines", name="BTC 收盘价", line=dict(color="black", width=1)),
+        go.Scatter(
+            x=dates, y=df["btc_close"], mode="lines", name=f"{asset_label} 收盘价", line=dict(color="black", width=1)
+        ),
         row=1,
         col=1,
     )
@@ -764,7 +780,7 @@ def build_price_and_equity_figure(
             col=1,
         )
 
-    fig.update_yaxes(type="log", title_text="BTC 价格 (USDT, 对数坐标)", row=1, col=1)
+    fig.update_yaxes(type="log", title_text=f"{asset_label} 价格 (USDT, 对数坐标)", row=1, col=1)
     fig.update_yaxes(type="log", title_text="策略净值 (USD, 初始资金 $100,000, 对数坐标)", row=2, col=1)
     fig.update_yaxes(title_text="回撤 (%)", row=3, col=1)
 
@@ -966,8 +982,10 @@ function sortTable(colIndex) {
 """
 
 
-def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str) -> str:
-    fig = build_price_and_equity_figure(df, results, best_name)
+def build_dashboard_html(
+    df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, asset_label: str = "BTC"
+) -> str:
+    fig = build_price_and_equity_figure(df, results, best_name, asset_label=asset_label)
     chart_html = fig.to_html(full_html=False, include_plotlyjs=True, div_id="backtest-chart")
     table_html = build_metrics_table_html(results, best_name)
     rules_html = build_rules_html(results)
@@ -976,11 +994,11 @@ def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], b
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>加密货币多因子量化策略回测看板</title>
+<title>{escape(asset_label)} 多因子量化策略回测看板</title>
 {DASHBOARD_STYLE}
 </head>
 <body>
-<h1>加密货币多因子量化策略回测与可视化看板</h1>
+<h1>{escape(asset_label)} 多因子量化策略回测与可视化看板</h1>
 <p class="subtitle">数据截至 {df['timestamp'].iloc[-1].date()} · 最佳策略（按夏普比率排序）：<b>{escape(best_name)}</b></p>
 <p class="hint">点击表头可按该列排序（再次点击切换升序/降序）。</p>
 {table_html}
@@ -992,9 +1010,11 @@ def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], b
 """
 
 
-def build_dashboard(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, output_path: Path) -> None:
+def build_dashboard(
+    df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, output_path: Path, asset_label: str = "BTC"
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    html = build_dashboard_html(df, results, best_name)
+    html = build_dashboard_html(df, results, best_name, asset_label=asset_label)
     output_path.write_text(html, encoding="utf-8")
 
 
@@ -1003,8 +1023,8 @@ def build_dashboard(df: pd.DataFrame, results: dict[str, StrategyResult], best_n
 # ---------------------------------------------------------------------------
 
 
-def build_markdown_report(results: dict[str, StrategyResult], best_name: str) -> str:
-    lines = ["## 加密货币多因子量化策略回测报告", ""]
+def build_markdown_report(results: dict[str, StrategyResult], best_name: str, asset_label: str = "BTC") -> str:
+    lines = [f"## {asset_label} 多因子量化策略回测报告", ""]
     lines.append(f"（假设初始资金 ${INITIAL_CAPITAL:,.0f}，按各策略净值曲线折算「期末净值」一列）")
     lines.append("")
 
@@ -1037,7 +1057,7 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
         )
     lines.append("")
     lines.append("完整交互式看板（可切换策略、排序表格、缩放图表）请在 Workflow Artifacts 中下载 "
-                 "`backtest_dashboard_<UTC时间戳>.html` 查看。")
+                 f"`backtest_dashboard_<资产代号>_<UTC时间戳>.html`（如 `backtest_dashboard_{asset_label.lower()}_<UTC时间戳>.html`）查看。")
     lines.append("")
     lines.append("### 策略规则说明（触发条件 → 目标仓位）")
     lines.append("")
@@ -1073,6 +1093,12 @@ def build_strategies() -> List[BaseStrategy]:
     ]
 
 
+ASSETS: List[Tuple[str, str]] = [
+    ("btc", "BTC"),
+    ("eth", "ETH"),
+]
+
+
 def main() -> None:
     # 保证控制台输出中文/emoji 时不因本地编码（如 Windows 下的 GBK）而报错
     if hasattr(sys.stdout, "reconfigure"):
@@ -1081,28 +1107,43 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="加密货币多因子量化策略回测与可视化系统")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="数据目录路径")
     parser.add_argument("--reports-dir", type=Path, default=REPORTS_DIR, help="报告输出目录路径")
+    parser.add_argument(
+        "--assets",
+        nargs="+",
+        default=[key for key, _ in ASSETS],
+        help="要回测的资产目录名（对应 data/<asset>/ 子目录），默认 btc eth 均运行，"
+        "所有资产使用完全相同的策略与仓位规则，仅数据来源不同。",
+    )
     args = parser.parse_args()
 
-    df = load_dataset(args.data_dir)
-
-    engine = BacktestEngine(df, build_strategies())
-    results = engine.run()
-    best_name = engine.best_strategy_name()
-
     args.reports_dir.mkdir(parents=True, exist_ok=True)
-
-    # 文件名带 UTC 时间戳，避免每次运行相互覆盖，便于在 reports/ 目录中追溯历史看板。
+    asset_labels = dict(ASSETS)
     run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    dashboard_path = args.reports_dir / f"backtest_dashboard_{run_timestamp}.html"
-    build_dashboard(df, results, best_name, dashboard_path)
 
-    report_markdown = build_markdown_report(results, best_name)
+    report_sections = []
+    for asset_key in args.assets:
+        asset_label = asset_labels.get(asset_key, asset_key.upper())
+
+        df = load_dataset(args.data_dir, asset=asset_key)
+
+        engine = BacktestEngine(df, build_strategies())
+        results = engine.run()
+        best_name = engine.best_strategy_name()
+
+        # 文件名带资产代号与 UTC 时间戳，避免不同资产、不同运行相互覆盖，
+        # 便于在 reports/ 目录中追溯历史看板。
+        dashboard_path = args.reports_dir / f"backtest_dashboard_{asset_key}_{run_timestamp}.html"
+        build_dashboard(df, results, best_name, dashboard_path, asset_label=asset_label)
+
+        report_markdown = build_markdown_report(results, best_name, asset_label=asset_label)
+        report_sections.append(report_markdown)
+        print(f"{asset_label} 交互式看板已保存至: {dashboard_path}", file=sys.stderr)
 
     # 仅打印到 stdout（供 CI 捕获后写入 $GITHUB_STEP_SUMMARY），不再落盘为
-    # reports/performance_summary.md —— reports/ 目录只产出带 UTC 时间戳的
-    # backtest_dashboard_<timestamp>.html（每次运行生成独立文件，便于追溯历史看板并提交入库）。
-    print(report_markdown)
-    print(f"交互式看板已保存至: {dashboard_path}", file=sys.stderr)
+    # reports/performance_summary.md —— reports/ 目录只产出带资产代号与 UTC 时间戳的
+    # backtest_dashboard_<asset>_<timestamp>.html（每次运行为每个资产生成独立文件，
+    # 便于追溯历史看板并提交入库）。
+    print("\n\n".join(report_sections))
 
 
 if __name__ == "__main__":

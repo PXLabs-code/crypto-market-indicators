@@ -41,7 +41,9 @@ jobs:
           fi
 
       - name: Run backtest
-        run: python scripts/backtest.py > backtest_summary.md
+        run: |
+          touch /tmp/backtest_run_marker
+          python scripts/backtest.py > backtest_summary.md
 
       - name: Publish performance summary
         if: always()
@@ -50,11 +52,16 @@ jobs:
             cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          latest_report="$(ls -t reports/backtest_dashboard_*.html 2>/dev/null | head -n 1)"
-          if [ -n "$latest_report" ]; then
+          # 一次运行会为每个资产（默认 BTC、ETH）各生成一个独立的看板文件，
+          # 用运行开始前创建的 marker 文件筛选出本次新生成的全部报告。
+          new_reports="$(find reports -maxdepth 1 -name 'backtest_dashboard_*.html' -newer /tmp/backtest_run_marker 2>/dev/null | sort)"
+          if [ -n "$new_reports" ]; then
             {
               echo ""
-              echo "> 📊 完整交互式看板（可切换策略买卖信号、排序绩效表格、显隐净值/回撤曲线）请在本次运行的 **Artifacts** 中下载 \`backtest-reports\` 并打开 \`$(basename "$latest_report")\` 查看，或直接在仓库 \`reports/\` 目录中查看已提交的版本。"
+              echo "> 📊 完整交互式看板（可切换策略买卖信号、排序绩效表格、显隐净值/回撤曲线）请在本次运行的 **Artifacts** 中下载 \`backtest-reports\`，或直接在仓库 \`reports/\` 目录中查看已提交的版本。本次生成的文件："
+              while IFS= read -r report_path; do
+                echo "> - \`$(basename "$report_path")\`"
+              done <<< "$new_reports"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
