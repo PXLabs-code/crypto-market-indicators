@@ -2,20 +2,29 @@ name: Strategy Backtest
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'data/**'
+  workflow_run:
+    workflows: ["Update Market Data"]
+    types: [completed]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    # workflow_run 事件在「Update Market Data」执行完成后总会触发一次，即使该次运行
+    # 未产生新的数据提交或本身失败；此处仅在手动触发，或 Update Market Data 成功完成时才继续执行。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # workflow_run 事件默认签出触发工作流时的默认分支 HEAD；显式指定其 head_sha，
+          # 确保拿到的是「Update Market Data」提交最新数据之后的那个提交。
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
@@ -41,14 +50,28 @@ jobs:
             cat backtest_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ -f reports/backtest_dashboard.html ]; then
+          latest_report="$(ls -t reports/backtest_dashboard_*.html 2>/dev/null | head -n 1)"
+          if [ -n "$latest_report" ]; then
             {
               echo ""
-              echo "> 📊 完整交互式看板（可切换策略买卖信号、排序绩效表格、显隐净值/回撤曲线）请在本次运行的 **Artifacts** 中下载 \`backtest-reports\` 并打开 \`backtest_dashboard.html\` 查看。"
+              echo "> 📊 完整交互式看板（可切换策略买卖信号、排序绩效表格、显隐净值/回撤曲线）请在本次运行的 **Artifacts** 中下载 \`backtest-reports\` 并打开 \`$(basename "$latest_report")\` 查看，或直接在仓库 \`reports/\` 目录中查看已提交的版本。"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           rm -f backtest_summary.md
+
+      - name: Commit and push report to repository
+        run: |
+          if [ -z "$(git status --porcelain -- reports)" ]; then
+            echo "No new report to commit"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports
+          git commit -m "Add backtest dashboard report: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git push
 
       - name: Upload reports artifact
         if: always()
