@@ -10,12 +10,15 @@ from scripts.update_data import (
     BINANCE_FUNDING_ENDPOINTS,
     BINANCE_SPOT_ENDPOINTS,
     BinanceRequestError,
+    FUNDING_FAILURE_POLICY_ENV,
     FNG_KNOWN_MISSING_TIMESTAMPS,
     _request_binance_json,
     _truncate_for_log,
     ensure_strict_continuity,
     fetch_binance_funding_rates,
+    fetch_coin_metrics_mvrv,
     fetch_binance_spot_ohlcv,
+    main,
     merge_deduplicate,
     render_non_fatal_issue_summary,
     update_fear_and_greed,
@@ -213,6 +216,25 @@ class UpdateDataTests(unittest.TestCase):
         self.assertIn("switching to next endpoint", joined_logs)
         self.assertIn("... [truncated]", joined_logs)
 
+    @patch("scripts.update_data._request_binance_json")
+    def test_fetch_binance_spot_ohlcv_paginates_in_1000_row_chunks(self, mock_request_binance_json):
+        first_batch = [[i * 86400000, "1", "2", "0.5", "1.5", "42"] for i in range(1000)]
+        second_batch = [[1000 * 86400000, "3", "4", "2", "3.5", "24"]]
+        mock_request_binance_json.side_effect = [first_batch, second_batch]
+
+        df = fetch_binance_spot_ohlcv("BTCUSDT", pd.Timestamp("1970-01-01T00:00:00Z"))
+
+        self.assertEqual(len(df), 1001)
+        self.assertEqual(mock_request_binance_json.call_count, 2)
+        self.assertEqual(
+            mock_request_binance_json.call_args_list[0].args[1]["startTime"],
+            0,
+        )
+        self.assertEqual(
+            mock_request_binance_json.call_args_list[1].args[1]["startTime"],
+            1000 * 86400000,
+        )
+
     @patch("scripts.update_data.time.sleep")
     @patch("scripts.update_data.requests.get")
     def test_request_binance_json_retries_429_with_backoff(self, mock_get, mock_sleep):
@@ -301,6 +323,47 @@ class UpdateDataTests(unittest.TestCase):
             [call.args[0] for call in mock_get.call_args_list[:2]],
             [BINANCE_FUNDING_ENDPOINTS[0], BINANCE_FUNDING_ENDPOINTS[1]],
         )
+
+    @patch("scripts.update_data._request_binance_json")
+    def test_fetch_binance_funding_rates_paginates_in_1000_row_chunks(self, mock_request_binance_json):
+        first_batch = [
+            {"fundingTime": i * 8 * 60 * 60 * 1000, "fundingRate": "0.0001"}
+            for i in range(1000)
+        ]
+        second_batch = [{"fundingTime": 1000 * 8 * 60 * 60 * 1000 + 1, "fundingRate": "0.0002"}]
+        mock_request_binance_json.side_effect = [first_batch, second_batch]
+
+        df = fetch_binance_funding_rates("BTCUSDT", pd.Timestamp("1970-01-01T00:00:00Z"))
+
+        self.assertEqual(len(df), 1001)
+        self.assertEqual(mock_request_binance_json.call_count, 2)
+        self.assertEqual(
+            mock_request_binance_json.call_args_list[0].args[1]["startTime"],
+            0,
+        )
+        self.assertEqual(
+            mock_request_binance_json.call_args_list[1].args[1]["startTime"],
+            1000 * 8 * 60 * 60 * 1000 - (8 * 60 * 60 * 1000) + 1,
+        )
+
+    @patch("scripts.update_data._request_json")
+    def test_fetch_coin_metrics_mvrv_paginates_with_next_page_token(self, mock_request_json):
+        mock_request_json.side_effect = [
+            {
+                "data": [{"time": "2026-01-01T00:00:00Z", "CapMVRVCur": "1.0"}],
+                "next_page_token": "page-2",
+            },
+            {
+                "data": [{"time": "2026-01-02T00:00:00Z", "CapMVRVCur": "1.1"}],
+            },
+        ]
+
+        df = fetch_coin_metrics_mvrv("btc", pd.Timestamp("2026-01-01T00:00:00Z"))
+
+        self.assertEqual(len(df), 2)
+        self.assertEqual(mock_request_json.call_count, 2)
+        self.assertNotIn("next_page_token", mock_request_json.call_args_list[0].args[1])
+        self.assertEqual(mock_request_json.call_args_list[1].args[1]["next_page_token"], "page-2")
 
     @patch("scripts.update_data.time.sleep")
     @patch("scripts.update_data.requests.get")
@@ -434,6 +497,41 @@ class UpdateDataTests(unittest.TestCase):
         self.assertIn("path=data/eth/funding_rates.csv", non_fatal_issues[0])
         self.assertIn("existing_file=missing", non_fatal_issues[0])
         self.assertIn(str(fetch_error), non_fatal_issues[0])
+
+    @patch("scripts.update_data._write_if_changed")
+    @patch("scripts.update_data._load_existing", return_value=pd.DataFrame())
+    def test_update_series_uses_bootstrap_start_time_when_no_existing_data(
+        self, mock_load_existing, mock_write_if_changed
+    ):
+        bootstrap = pd.Timestamp("2020-01-01T00:00:00Z")
+        fetched = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2020-01-01T00:00:00Z"], utc=True),
+                "value": [1.0],
+            }
+        )
+        fetch_fn = Mock(return_value=fetched)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data" / "asset.csv"
+            update_series(path, fetch_fn, "1D", bootstrap_start_time=bootstrap)
+
+        fetch_fn.assert_called_once_with(bootstrap)
+        mock_write_if_changed.assert_called_once()
+        mock_load_existing.assert_called_once()
+
+    @patch("scripts.update_data.update_fear_and_greed")
+    @patch("scripts.update_data.update_asset")
+    def test_main_raises_when_funding_failure_policy_is_fail(self, mock_update_asset, mock_update_fng):
+        def side_effect(asset_code, symbol, issues):
+            if asset_code == "btc":
+                issues.append("BTCUSDT funding failed")
+
+        mock_update_asset.side_effect = side_effect
+
+        with patch.dict("os.environ", {FUNDING_FAILURE_POLICY_ENV: "fail"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                main()
 
     def test_render_non_fatal_issue_summary_includes_all_issues(self):
         issues = [
