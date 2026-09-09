@@ -330,12 +330,12 @@ Before adding an asset, confirm:
 
 ## Multi-factor quantitative strategy backtest and visualization
 
-Beyond data collection, this repository also ships a complete crypto multi-factor quantitative strategy backtesting system (`scripts/backtest.py`) that automatically generates an interactive HTML dashboard from the daily data in `data/`.
+Beyond data collection, this repository also ships a complete crypto multi-factor quantitative strategy backtesting system (`scripts/backtest.py`) that automatically generates an interactive HTML dashboard from the daily data in `data/`. By default it runs **independently for both BTC and ETH**, using the exact same strategy code and position rules for each, and produces a separate dashboard and Markdown report per asset (pass `--assets` to run only one, or a different `data/<asset>/` subdirectory).
 
 ### Data preprocessing
 
 - Funding rate is aggregated to a UTC daily mean (`groupby(date).mean()`).
-- All datasets are left-outer-joined on `timestamp`, anchored to the BTC price date axis.
+- All datasets are left-outer-joined on `timestamp`, anchored to the corresponding asset's (BTC or ETH) price date axis.
 - Missing values are only handled with `.ffill()` (forward fill); `.bfill()` is never used, to avoid look-ahead bias.
 
 ### Strategies
@@ -361,9 +361,9 @@ Computed with 365-day annualization for crypto markets: cumulative return, annua
 
 ### Interactive dashboard
 
-Running the script produces a self-contained Plotly HTML dashboard in `reports/`, named `backtest_dashboard_<UTC timestamp>.html`, containing:
+Running the script produces a separate self-contained Plotly HTML dashboard per asset in `reports/`, named `backtest_dashboard_<asset>_<UTC timestamp>.html` (e.g. `backtest_dashboard_btc_20260909_140153.html`, `backtest_dashboard_eth_20260909_140153.html`), containing:
 
-1. BTC price on a log scale, with a dropdown menu to switch which strategy's buy/sell (position-change) markers are shown;
+1. that asset's price on a log scale, with a dropdown menu to switch which strategy's buy/sell (position-change) markers are shown;
 2. a comparison of each strategy's cumulative equity curve (log scale), with legend entries that can be clicked to manually show/hide individual strategies;
 3. a comparison of each strategy's dynamic drawdown (%) fill chart;
 4. a sortable strategy performance comparison table, plus the latest (T-0) position forecast signal for each strategy.
@@ -375,14 +375,14 @@ python -m pip install -r requirements.txt
 python scripts/backtest.py
 ```
 
-The generated dashboard is written to `reports/backtest_dashboard_<UTC timestamp>.html`.
+By default this generates both a BTC and an ETH dashboard, written to `reports/backtest_dashboard_btc_<UTC timestamp>.html` and `reports/backtest_dashboard_eth_<UTC timestamp>.html`. To run only one asset, pass `--assets btc` or `--assets eth`.
 
 ### GitHub Actions: automated backtests
 
 The workflow file is `.github/workflows/backtest.yml`, named **Strategy Backtest**:
 
 - Triggers: `workflow_dispatch` (manual) and `workflow_run` (automatically, after **Update Market Data** completes successfully);
-- runs the backtest script and appends the strategy performance Markdown comparison table to the Job Summary (`$GITHUB_STEP_SUMMARY`);
+- runs the backtest script (generating both a BTC and an ETH report by default) and appends the strategy performance Markdown comparison table to the Job Summary (`$GITHUB_STEP_SUMMARY`);
 - commits the generated dashboard HTML back into the repository's `reports/` directory, and also packages it as a Workflow Artifact (`backtest-reports`) for download.
 
 ## Notes

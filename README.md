@@ -330,12 +330,12 @@ update_asset("sol", "SOLUSDT")
 
 ## 多因子量化策略回测与可视化
 
-除数据采集外，仓库还提供一套完整的加密货币多因子量化策略回测系统（`scripts/backtest.py`），基于 `data/` 目录中的日度数据自动生成交互式 HTML 看板。
+除数据采集外，仓库还提供一套完整的加密货币多因子量化策略回测系统（`scripts/backtest.py`），基于 `data/` 目录中的日度数据自动生成交互式 HTML 看板。默认会对 **BTC 与 ETH 分别独立运行**，两者使用完全相同的策略代码与仓位规则，仅数据来源不同，各自生成独立的看板与 Markdown 报告（可通过 `--assets` 参数指定运行其中一个或其他 `data/<asset>/` 子目录）。
 
 ### 数据预处理
 
 - 资金费率按 UTC 日度聚合取均值（`groupby(date).mean()`）。
-- 所有数据按 `timestamp` 以 BTC 价格日期为主轴左外连接。
+- 所有数据按 `timestamp` 以对应资产（BTC 或 ETH）价格日期为主轴左外连接。
 - 缺失值仅使用 `.ffill()` 前向填充，不使用 `.bfill()`，避免未来数据泄露。
 
 ### 策略列表
@@ -361,9 +361,9 @@ update_asset("sol", "SOLUSDT")
 
 ### 交互式看板
 
-运行后在 `reports/` 目录生成自包含的 Plotly HTML 看板 `backtest_dashboard_<UTC时间戳>.html`，包含：
+运行后在 `reports/` 目录为每个资产分别生成一份自包含的 Plotly HTML 看板 `backtest_dashboard_<资产代号>_<UTC时间戳>.html`（如 `backtest_dashboard_btc_20260909_140153.html`、`backtest_dashboard_eth_20260909_140153.html`），包含：
 
-1. BTC 对数坐标价格走势，可通过下拉菜单切换查看指定策略的买卖/调仓信号标记点；
+1. 对应资产对数坐标价格走势，可通过下拉菜单切换查看指定策略的买卖/调仓信号标记点；
 2. 各策略累计净值曲线对比（对数坐标），可点击图例手动勾选/取消显示；
 3. 各策略动态回撤（%）填充图对比；
 4. 可排序的策略绩效指标对比表格，以及最新一日（T-0）仓位预测信号。
@@ -375,14 +375,14 @@ python -m pip install -r requirements.txt
 python scripts/backtest.py
 ```
 
-生成的看板会输出到 `reports/backtest_dashboard_<UTC时间戳>.html`。
+默认依次生成 BTC 与 ETH 两份看板，分别输出到 `reports/backtest_dashboard_btc_<UTC时间戳>.html` 与 `reports/backtest_dashboard_eth_<UTC时间戳>.html`。如只需要其中一个资产，可加 `--assets btc` 或 `--assets eth`。
 
 ### GitHub Actions 自动回测
 
 工作流文件位于 `.github/workflows/backtest.yml`，名称为 **Strategy Backtest**：
 
 - 触发方式：`workflow_dispatch`（手动触发）与 `workflow_run`（在 **Update Market Data** 成功运行后自动触发）；
-- 运行回测脚本，并将策略绩效 Markdown 对比表追加至 Job Summary（`$GITHUB_STEP_SUMMARY`）；
+- 运行回测脚本（默认同时生成 BTC 与 ETH 两份报告），并将策略绩效 Markdown 对比表追加至 Job Summary（`$GITHUB_STEP_SUMMARY`）；
 - 将生成的看板 HTML 提交回仓库 `reports/` 目录，并同时打包为 Workflow Artifacts（`backtest-reports`）供下载查看。
 
 ## 注意事项
