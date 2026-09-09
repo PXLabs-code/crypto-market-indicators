@@ -17,6 +17,7 @@ from scripts.update_data import (
     fetch_binance_funding_rates,
     fetch_binance_spot_ohlcv,
     merge_deduplicate,
+    render_non_fatal_issue_summary,
     update_fear_and_greed,
     update_series,
 )
@@ -374,19 +375,34 @@ class UpdateDataTests(unittest.TestCase):
             }
         )
         mock_load_existing.return_value = existing
-        fetch_fn = Mock(side_effect=BinanceRequestError("blocked"))
+        fetch_error = BinanceRequestError(
+            "All Binance futures fundingRate endpoints failed. Final failures: https://fapi.binance.com -> HTTP 451"
+        )
+        fetch_fn = Mock(side_effect=fetch_error)
+        non_fatal_issues = []
 
-        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
-            update_series(
-                Path("/tmp/funding_rates.csv"),
-                fetch_fn,
-                "8h",
-                allow_stale_on_fetch_error=True,
-            )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data" / "btc" / "funding_rates.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("timestamp,funding_rate\n2026-01-01T00:00:00Z,0.0001\n", encoding="utf-8")
+            with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+                update_series(
+                    path,
+                    fetch_fn,
+                    "8h",
+                    allow_stale_on_fetch_error=True,
+                    non_fatal_issues=non_fatal_issues,
+                    issue_context="BTCUSDT",
+                )
 
         fetch_fn.assert_called_once()
         mock_write_if_changed.assert_not_called()
         self.assertIn("keeping existing data unchanged", "\n".join(logs.output))
+        self.assertEqual(len(non_fatal_issues), 1)
+        self.assertIn("BTCUSDT", non_fatal_issues[0])
+        self.assertIn("path=data/btc/funding_rates.csv", non_fatal_issues[0])
+        self.assertIn("existing_file=present", non_fatal_issues[0])
+        self.assertIn(str(fetch_error), non_fatal_issues[0])
 
     @patch("scripts.update_data._load_existing")
     @patch("scripts.update_data._write_if_changed")
@@ -394,17 +410,41 @@ class UpdateDataTests(unittest.TestCase):
         self, mock_write_if_changed, mock_load_existing
     ):
         mock_load_existing.return_value = pd.DataFrame()
+        fetch_error = BinanceRequestError(
+            "All Binance futures fundingRate endpoints failed. Final failures: https://fapi1.binance.com -> invalid JSON"
+        )
+        non_fatal_issues = []
 
-        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
-            update_series(
-                Path("/tmp/funding_rates.csv"),
-                Mock(side_effect=BinanceRequestError("blocked")),
-                "8h",
-                allow_stale_on_fetch_error=True,
-            )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data" / "eth" / "funding_rates.csv"
+            with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+                update_series(
+                    path,
+                    Mock(side_effect=fetch_error),
+                    "8h",
+                    allow_stale_on_fetch_error=True,
+                    non_fatal_issues=non_fatal_issues,
+                    issue_context="ETHUSDT",
+                )
 
         mock_write_if_changed.assert_not_called()
         self.assertIn("no existing data available yet", "\n".join(logs.output))
+        self.assertEqual(len(non_fatal_issues), 1)
+        self.assertIn("ETHUSDT", non_fatal_issues[0])
+        self.assertIn("path=data/eth/funding_rates.csv", non_fatal_issues[0])
+        self.assertIn("existing_file=missing", non_fatal_issues[0])
+        self.assertIn(str(fetch_error), non_fatal_issues[0])
+
+    def test_render_non_fatal_issue_summary_includes_all_issues(self):
+        issues = [
+            "BTCUSDT | path=data/btc/funding_rates.csv | existing_file=missing | reason=Binance fetch failed: blocked",
+            "ETHUSDT | path=data/eth/funding_rates.csv | existing_file=present | reason=Binance fetch failed: blocked",
+        ]
+        rendered = render_non_fatal_issue_summary(issues)
+
+        self.assertIn("=== NON-FATAL DATA UPDATE ISSUES ===", rendered)
+        self.assertIn(f"- {issues[0]}", rendered)
+        self.assertIn(f"- {issues[1]}", rendered)
 
     def test_truncate_for_log_limits_body_length(self):
         truncated = _truncate_for_log("x" * 400, max_chars=20)

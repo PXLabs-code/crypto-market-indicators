@@ -31,7 +31,17 @@ jobs:
           fi
 
       - name: Run update script
+        env:
+          NON_FATAL_ISSUES_OUTPUT: ${{ runner.temp }}/non_fatal_data_update_issues.md
         run: python scripts/update_data.py
+
+      - name: Publish non-fatal update issues summary
+        if: always()
+        run: |
+          ISSUE_FILE="${{ runner.temp }}/non_fatal_data_update_issues.md"
+          if [ -s "$ISSUE_FILE" ]; then
+            cat "$ISSUE_FILE" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Commit and push updated data
         run: |
