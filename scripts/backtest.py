@@ -2,12 +2,14 @@
 
 读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（BTC 现货 OHLCV、
 BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，
-对三套仓位策略（Buy & Hold 基准、情绪与估值阈值、多因子加权打分）进行历史回测，
-计算绩效指标，并生成三栏可视化看板 PNG 及 Markdown 绩效对比表。
+对 6 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
+以及 Markdown 绩效对比表。
 
 设计原则：
     - 严禁未来函数：所有需要 T+1 日才能知道的仓位一律 ``.shift(1)`` 后再参与收益计算。
     - 缺失值仅允许 ``.ffill()``，不允许 ``.bfill()``，避免用未来数据填补历史空值。
+    - 所有策略均输出分级仓位 {0%, 25%, 50%, 75%, 100%}，非仓位打分类信号最终都会
+      对齐（snap）到这一仓位网格上。
 """
 
 from __future__ import annotations
@@ -16,44 +18,14 @@ import argparse
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import List
 
-import matplotlib
-
-matplotlib.use("Agg")  # 无显示环境下生成图片，必须在 pyplot 导入前设置
-
-import matplotlib.dates as mdates
-import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-
-def _configure_cjk_font() -> None:
-    """尽量选用系统内可用的中文字体，避免图表中的中文显示为方块（tofu）。
-
-    在 GitHub Actions（ubuntu-latest）上建议预先安装 ``fonts-noto-cjk``；
-    本地 Windows/macOS 常见中文字体也在候选列表中，找不到时静默回退到默认字体。
-    """
-    candidates = [
-        "Noto Sans CJK SC",
-        "Noto Sans CJK",
-        "Microsoft YaHei",
-        "SimHei",
-        "PingFang SC",
-        "WenQuanYi Zen Hei",
-        "Source Han Sans SC",
-    ]
-    available = {f.name for f in fm.fontManager.ttflist}
-    for name in candidates:
-        if name in available:
-            matplotlib.rcParams["font.sans-serif"] = [name]
-            break
-    matplotlib.rcParams["axes.unicode_minus"] = False
-
-
-_configure_cjk_font()
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ---------------------------------------------------------------------------
 # 全局常量
@@ -68,10 +40,23 @@ TRADING_COST_RATE = 0.001  # 单边手续费 + 滑点 0.1%
 RISK_FREE_RATE = 0.0
 
 MA_SHORT_WINDOW = 20
-MA_LONG_WINDOW = 60
+MA_LONG_WINDOW = 200
+VOLATILITY_WINDOW = 20
 
-# 仓位分级仓位标签，供图表 / 报告展示使用
-POSITION_LABELS = {0.0: "空仓 0%", 0.3: "轻仓 30%", 0.5: "半仓 50%", 0.6: "中仓 60%", 1.0: "满仓 100%"}
+# 分级仓位网格：所有策略最终仓位都会被吸附到这 5 档上
+POSITION_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+
+def snap_to_grid(series: pd.Series, grid: List[float] = POSITION_GRID) -> pd.Series:
+    """将连续仓位值就近吸附到分级仓位网格上（0% / 25% / 50% / 75% / 100%）。"""
+    grid_arr = np.asarray(grid, dtype=float)
+    values = series.to_numpy(dtype=float)
+    nan_mask = np.isnan(values)
+    values = np.nan_to_num(values, nan=0.0)
+    idx = np.abs(values[:, None] - grid_arr[None, :]).argmin(axis=1)
+    snapped = grid_arr[idx]
+    snapped[nan_mask] = np.nan
+    return pd.Series(snapped, index=series.index, name=series.name)
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +113,15 @@ def load_dataset(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     df["btc_return"] = df["btc_close"].pct_change()
     df["ma_short"] = df["btc_close"].rolling(MA_SHORT_WINDOW, min_periods=MA_SHORT_WINDOW).mean()
     df["ma_long"] = df["btc_close"].rolling(MA_LONG_WINDOW, min_periods=MA_LONG_WINDOW).mean()
+    # 历史已实现波动率（年化），仅使用过去 N 日收益，纯回溯不涉及未来数据
+    df["realized_vol"] = df["btc_return"].rolling(VOLATILITY_WINDOW, min_periods=VOLATILITY_WINDOW).std() * np.sqrt(
+        ANNUALIZATION_DAYS
+    )
+    # MVRV 历史分位数：expanding().rank() 只使用截至当日（含）的历史数据，不引入未来信息
+    df["mvrv_percentile"] = df["mvrv"].expanding(min_periods=30).rank(pct=True)
 
-    # 均线未形成前的行同样无法参与均线趋势打分，一并丢弃保持面板数据完整可用
-    df = df.dropna(subset=["ma_short", "ma_long"]).reset_index(drop=True)
+    # 均线、波动率、分位数等滚动特征形成之前的行无法参与策略评估，一并丢弃
+    df = df.dropna(subset=["ma_short", "ma_long", "realized_vol", "mvrv_percentile"]).reset_index(drop=True)
 
     return df
 
@@ -144,8 +135,8 @@ class BaseStrategy(ABC):
     """策略基类：子类只需实现 ``generate_signals``，返回当日收盘后决定的目标仓位。
 
     返回的 ``position`` 序列语义为「T 日收盘后，基于 T 日及之前可得信息决定的目标仓位」，
-    取值范围 [0.0, 1.0]。回测引擎会对其整体 ``shift(1)`` 后再与 T+1 日收益率相乘，
-    从而保证不使用未来函数。
+    取值须来自分级仓位网格 ``POSITION_GRID``（0% / 25% / 50% / 75% / 100%）。
+    回测引擎会对其整体 ``shift(1)`` 后再与 T+1 日收益率相乘，从而保证不使用未来函数。
     """
 
     name: str = "BaseStrategy"
@@ -156,106 +147,166 @@ class BaseStrategy(ABC):
 
 
 class BuyAndHoldStrategy(BaseStrategy):
-    """基准策略：全程满仓 100%。"""
+    """a) Benchmark: BTC Buy & Hold —— 全程满仓 100%。"""
 
-    name = "Buy & Hold 基准"
+    name = "a) Buy & Hold 基准"
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         return pd.Series(1.0, index=df.index, name="position")
 
 
-class SentimentValuationStrategy(BaseStrategy):
-    """情绪与估值阈值策略：结合 FGI（情绪）与 MVRV（估值）划分 0% / 50% / 100% 仓位。
+class TrendFollowingStrategy(BaseStrategy):
+    """b) Trend Following：双均线（MA20/MA200）趋势策略。
 
-    阈值假设（可按需调整）：
-        - 极度贪婪（FGI >= 75）且明显高估（MVRV >= 3.0） -> 清仓 0%，警惕顶部风险。
-        - 极度恐惧（FGI <= 25）且明显低估（MVRV <= 1.0） -> 满仓 100%，博反转。
-        - 其余情况 -> 半仓 50%，中性持有。
+    以短均线相对长均线的偏离幅度衡量趋势强度，偏离越大仓位越高（金叉顺势），
+    偏离为负且幅度越大仓位越低（死叉减仓/清仓）。
     """
 
-    name = "情绪估值阈值策略"
+    name = "b) 双均线趋势策略"
 
-    FGI_EXTREME_GREED = 75
-    FGI_EXTREME_FEAR = 25
-    MVRV_OVERVALUED = 3.0
-    MVRV_UNDERVALUED = 1.0
+    # 偏离幅度分级阈值：(短均线-长均线)/长均线
+    THRESHOLDS = [(0.08, 1.0), (0.03, 0.75), (-0.03, 0.5), (-0.08, 0.25)]
+    FLOOR_WEIGHT = 0.0
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        spread = (df["ma_short"] - df["ma_long"]) / df["ma_long"]
+        position = pd.Series(self.FLOOR_WEIGHT, index=df.index, name="position")
+        for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: item[0]):
+            position[spread >= threshold] = weight
+        return position
+
+
+class ValuationMeanReversionStrategy(BaseStrategy):
+    """c) Valuation Mean-Reversion：MVRV 历史分位数高抛低吸策略。
+
+    MVRV 分位数越低（历史级低估）越加仓博均值回归上行，分位数越高（历史级高估）
+    越减仓规避回调风险。分位数使用 ``expanding().rank(pct=True)``，只回溯不前瞻。
+    """
+
+    name = "c) MVRV 估值分位数策略"
+
+    # (分位数上限, 仓位) —— 分位数从低到高分级
+    THRESHOLDS = [(0.10, 1.0), (0.30, 0.75), (0.70, 0.5), (0.90, 0.25)]
+    CEILING_WEIGHT = 0.0  # 分位数 > 0.90（历史级高估）时清仓
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        percentile = df["mvrv_percentile"]
+        position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
+        for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
+            position[percentile <= threshold] = weight
+        return position
+
+
+class SentimentRegimeStrategy(BaseStrategy):
+    """d) Sentiment Regime：Fear & Greed 极值反转策略。
+
+    情绪指数越接近「极度恐惧」越逆势加仓，越接近「极度贪婪」越逆势减仓，
+    在两端之间按情绪强度分级过渡。
+    """
+
+    name = "d) 情绪极值反转策略"
+
+    # (FGI 上限, 仓位) —— FGI 从低（恐惧）到高（贪婪）分级
+    THRESHOLDS = [(20, 1.0), (40, 0.75), (60, 0.5), (80, 0.25)]
+    CEILING_WEIGHT = 0.0  # FGI > 80（极度贪婪）时清仓
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         fgi = df["fear_greed_value"]
-        mvrv = df["mvrv"]
-
-        position = pd.Series(0.5, index=df.index, name="position")
-
-        overheated = (fgi >= self.FGI_EXTREME_GREED) & (mvrv >= self.MVRV_OVERVALUED)
-        oversold = (fgi <= self.FGI_EXTREME_FEAR) & (mvrv <= self.MVRV_UNDERVALUED)
-
-        position[overheated] = 0.0
-        position[oversold] = 1.0
+        position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
+        for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
+            position[fgi <= threshold] = weight
         return position
+
+
+# --- 多因子综合打分（供 e 与 f 两个策略共用）---------------------------------
+
+MVRV_SCORE_LOW, MVRV_SCORE_HIGH = 0.8, 3.5  # MVRV 归一化区间：<=0.8 深度低估，>=3.5 历史级高估
+FUNDING_SCORE_EXTREME = 0.001  # 日均资金费率的极端参考值（0.1%）
+
+WEIGHT_MVRV = 0.35
+WEIGHT_FGI = 0.25
+WEIGHT_FUNDING = 0.20
+WEIGHT_MA = 0.20
+
+
+def _clip01(series: pd.Series) -> pd.Series:
+    return series.clip(lower=0.0, upper=1.0)
+
+
+def _score_mvrv(mvrv: pd.Series) -> pd.Series:
+    normalized = (MVRV_SCORE_HIGH - mvrv) / (MVRV_SCORE_HIGH - MVRV_SCORE_LOW)
+    return _clip01(normalized) * 100
+
+
+def _score_fgi(fgi: pd.Series) -> pd.Series:
+    # FGI 本身即恐惧(低分=看多)到贪婪(高分=看空)的 0-100 指标，反转即为看多分数
+    return 100 - fgi
+
+
+def _score_funding(funding_rate: pd.Series) -> pd.Series:
+    normalized = 0.5 - (funding_rate / FUNDING_SCORE_EXTREME) * 0.5
+    return _clip01(normalized) * 100
+
+
+def _score_ma_trend(df: pd.DataFrame) -> pd.Series:
+    bullish = (df["btc_close"] > df["ma_long"]) & (df["ma_short"] > df["ma_long"])
+    bearish = (df["btc_close"] < df["ma_long"]) & (df["ma_short"] < df["ma_long"])
+    score = pd.Series(50.0, index=df.index)
+    score[bullish] = 100.0
+    score[bearish] = 0.0
+    return score
+
+
+def compute_composite_score(df: pd.DataFrame) -> pd.Series:
+    """综合打分：MVRV(35%) + FGI(25%) + 资金费率(20%) + 均线趋势(20%) -> 0-100 分。"""
+    return (
+        WEIGHT_MVRV * _score_mvrv(df["mvrv"])
+        + WEIGHT_FGI * _score_fgi(df["fear_greed_value"])
+        + WEIGHT_FUNDING * _score_funding(df["funding_rate"])
+        + WEIGHT_MA * _score_ma_trend(df)
+    )
 
 
 class MultiFactorScoringStrategy(BaseStrategy):
-    """多因子加权打分策略：MVRV(35%) + FGI(25%) + 资金费率(20%) + 均线趋势(20%) -> 0-100 综合分。
+    """e) Multi-Factor Scoring：MVRV(35%) + FGI(25%) + 资金费率(20%) + 均线(20%) 综合打分。
 
-    各因子先分别归一化为 0-100 的「看多分数」（分数越高越看多），加权求和后
-    映射到 0% / 30% / 60% / 100% 四级仓位。
+    综合分映射至 0% / 25% / 50% / 75% / 100% 五级仓位。
     """
 
-    name = "多因子加权打分策略"
+    name = "e) 多因子加权打分策略"
 
-    WEIGHT_MVRV = 0.35
-    WEIGHT_FGI = 0.25
-    WEIGHT_FUNDING = 0.20
-    WEIGHT_MA = 0.20
-
-    # MVRV 归一化区间：<=0.8 视为深度低估(100分)，>=3.5 视为历史级高估(0分)
-    MVRV_LOW, MVRV_HIGH = 0.8, 3.5
-    # 资金费率归一化区间：正费率越高代表多头拥挤程度越高（看空），负费率相反（看多）
-    FUNDING_EXTREME = 0.001  # 0.1%，日均资金费率的极端参考值
-
-    SCORE_THRESHOLDS = [(75, 1.0), (55, 0.6), (35, 0.3), (0, 0.0)]
-
-    @staticmethod
-    def _clip01(series: pd.Series) -> pd.Series:
-        return series.clip(lower=0.0, upper=1.0)
-
-    def _score_mvrv(self, mvrv: pd.Series) -> pd.Series:
-        normalized = (self.MVRV_HIGH - mvrv) / (self.MVRV_HIGH - self.MVRV_LOW)
-        return self._clip01(normalized) * 100
-
-    def _score_fgi(self, fgi: pd.Series) -> pd.Series:
-        # FGI 本身即恐惧(低分=看多)到贪婪(高分=看空)的 0-100 指标，反转即为看多分数
-        return 100 - fgi
-
-    def _score_funding(self, funding_rate: pd.Series) -> pd.Series:
-        normalized = 0.5 - (funding_rate / self.FUNDING_EXTREME) * 0.5
-        return self._clip01(normalized) * 100
-
-    def _score_ma_trend(self, df: pd.DataFrame) -> pd.Series:
-        bullish = (df["btc_close"] > df["ma_long"]) & (df["ma_short"] > df["ma_long"])
-        bearish = (df["btc_close"] < df["ma_long"]) & (df["ma_short"] < df["ma_long"])
-        score = pd.Series(50.0, index=df.index)
-        score[bullish] = 100.0
-        score[bearish] = 0.0
-        return score
-
-    def composite_score(self, df: pd.DataFrame) -> pd.Series:
-        score = (
-            self.WEIGHT_MVRV * self._score_mvrv(df["mvrv"])
-            + self.WEIGHT_FGI * self._score_fgi(df["fear_greed_value"])
-            + self.WEIGHT_FUNDING * self._score_funding(df["funding_rate"])
-            + self.WEIGHT_MA * self._score_ma_trend(df)
-        )
-        return score
+    SCORE_THRESHOLDS = [(80, 1.0), (65, 0.75), (45, 0.5), (30, 0.25)]
+    FLOOR_WEIGHT = 0.0  # 综合分 < 30 时清仓
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        score = self.composite_score(df)
-        position = pd.Series(0.0, index=df.index, name="position")
-        # 必须按阈值从低到高依次赋值，让更高档位的赋值覆盖更低档位，
-        # 否则最后一次循环（>=0 恒真）会把所有仓位错误地重置为最低档。
+        score = compute_composite_score(df)
+        position = pd.Series(self.FLOOR_WEIGHT, index=df.index, name="position")
         for threshold, weight in sorted(self.SCORE_THRESHOLDS, key=lambda item: item[0]):
             position[score >= threshold] = weight
         return position
+
+
+class DynamicVolTargetingStrategy(BaseStrategy):
+    """f) Dynamic Vol-Targeting：多因子打分 * 波动率反比的动态风险控制策略。
+
+    以多因子综合分（0-100 映射到 0-1）作为基础仓位方向，再乘以「目标波动率 / 已实现
+    波动率」的风险缩放系数：已实现波动率越高（市场越剧烈），仓位相应收缩；波动率越低
+    （市场越平稳），在基础方向允许范围内适度放大仓位。风险缩放系数设置上下限以避免
+    极端放大或过度清零，最终结果吸附到分级仓位网格。
+    """
+
+    name = "f) 动态波动率目标策略"
+
+    TARGET_ANNUAL_VOL = 0.5  # 目标年化波动率 50%，作为风险预算基准
+    RISK_SCALE_MIN, RISK_SCALE_MAX = 0.2, 1.5
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        base_position = compute_composite_score(df) / 100.0
+        risk_scale = (self.TARGET_ANNUAL_VOL / df["realized_vol"]).clip(
+            lower=self.RISK_SCALE_MIN, upper=self.RISK_SCALE_MAX
+        )
+        raw_position = (base_position * risk_scale).clip(0.0, 1.0)
+        return snap_to_grid(raw_position)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +351,8 @@ def compute_metrics(result: "StrategyResult") -> dict:
     avg_win = wins.mean() if len(wins) else 0.0
     avg_loss = abs(losses.mean()) if len(losses) else 0.0
     profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else np.nan
+    total_decided = len(wins) + len(losses)
+    win_rate_pct = (len(wins) / total_decided * 100) if total_decided > 0 else np.nan
 
     return {
         "cumulative_return_pct": cumulative_return_pct,
@@ -307,6 +360,7 @@ def compute_metrics(result: "StrategyResult") -> dict:
         "mdd_pct": mdd_pct,
         "sharpe_ratio": sharpe,
         "calmar_ratio": calmar,
+        "win_rate_pct": win_rate_pct,
         "profit_loss_ratio": profit_loss_ratio,
         "trade_count": result.trade_count,
     }
@@ -330,7 +384,7 @@ class BacktestEngine:
         btc_return = self.df["btc_return"].fillna(0.0)
 
         for strategy in self.strategies:
-            raw_position = strategy.generate_signals(self.df).clip(0.0, 1.0)
+            raw_position = snap_to_grid(strategy.generate_signals(self.df).clip(0.0, 1.0))
             raw_position.name = "position"
 
             # 关键防未来函数处理：T 日生成的仓位需 shift(1)，
@@ -400,65 +454,297 @@ def latest_signal(result: StrategyResult) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5. 可视化看板
+# 5. 交互式 Plotly 可视化看板
 # ---------------------------------------------------------------------------
 
+PALETTE = [
+    "#1f77b4",  # 蓝
+    "#ff7f0e",  # 橙
+    "#2ca02c",  # 绿
+    "#d62728",  # 红
+    "#9467bd",  # 紫
+    "#8c564b",  # 棕
+]
 
-def plot_dashboard(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, (ax_price, ax_equity, ax_dd) = plt.subplots(
-        3, 1, figsize=(16, 14), dpi=150, sharex=True, gridspec_kw={"height_ratios": [2, 1.4, 1]}
-    )
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {alpha})"
 
+
+def build_price_and_equity_figure(df: pd.DataFrame, results: dict[str, StrategyResult]) -> go.Figure:
+    strategy_names = list(results.keys())
     dates = df["timestamp"]
-    best_result = results[best_name]
 
-    # --- 栏 1：BTC 对数价格 + 最佳策略买卖点 ---
-    ax_price.plot(dates, df["btc_close"], color="black", linewidth=1.0, label="BTC 收盘价")
-    ax_price.set_yscale("log")
-    ax_price.set_ylabel("BTC 价格 (USDT, 对数坐标)")
-    ax_price.set_title(f"BTC 价格走势与最佳策略交易信号（{best_name}）")
-
-    position_change = best_result.position.diff()
-    buy_points = position_change > 1e-9
-    sell_points = position_change < -1e-9
-
-    ax_price.scatter(
-        dates[buy_points], df["btc_close"][buy_points], marker="^", color="green", s=60, zorder=5, label="买入/加仓"
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.42, 0.36, 0.22],
+        subplot_titles=(
+            "BTC 价格走势与策略买卖信号（使用上方下拉菜单切换策略）",
+            "各策略累计净值曲线对比（对数坐标，点击图例可显示/隐藏）",
+            "各策略动态回撤 (%) 对比",
+        ),
     )
-    ax_price.scatter(
-        dates[sell_points], df["btc_close"][sell_points], marker="v", color="red", s=60, zorder=5, label="卖出/减仓"
-    )
-    ax_price.legend(loc="upper left")
-    ax_price.grid(True, which="both", linestyle="--", alpha=0.3)
 
-    # --- 栏 2：各策略累计净值对比（对数坐标）---
+    # --- 栏 1：BTC 价格 + 各策略买卖点（默认仅显示第一个策略，可通过下拉菜单切换）---
+    fig.add_trace(
+        go.Scatter(x=dates, y=df["btc_close"], mode="lines", name="BTC 收盘价", line=dict(color="black", width=1)),
+        row=1,
+        col=1,
+    )
+
+    signal_trace_indices: list[int] = []
+    for i, name in enumerate(strategy_names):
+        result = results[name]
+        position_change = result.position.diff()
+        buy_mask = position_change > 1e-9
+        sell_mask = position_change < -1e-9
+        visible = i == 0
+
+        fig.add_trace(
+            go.Scatter(
+                x=dates[buy_mask],
+                y=df["btc_close"][buy_mask],
+                mode="markers",
+                name=f"{name} · 买入/加仓",
+                marker=dict(symbol="triangle-up", color="green", size=9, line=dict(width=1, color="darkgreen")),
+                visible=visible,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        signal_trace_indices.append(len(fig.data) - 1)
+
+        fig.add_trace(
+            go.Scatter(
+                x=dates[sell_mask],
+                y=df["btc_close"][sell_mask],
+                mode="markers",
+                name=f"{name} · 卖出/减仓",
+                marker=dict(symbol="triangle-down", color="red", size=9, line=dict(width=1, color="darkred")),
+                visible=visible,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        signal_trace_indices.append(len(fig.data) - 1)
+
+    # --- 栏 2 / 栏 3：各策略净值曲线与回撤曲线，共用图例组（legendgroup）联动显隐 ---
+    for i, name in enumerate(strategy_names):
+        result = results[name]
+        color = PALETTE[i % len(PALETTE)]
+
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=result.equity_curve,
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                line=dict(color=color, width=1.8),
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=result.drawdown * 100,
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=False,
+                line=dict(color=color, width=1.2),
+                fill="tozeroy",
+                fillcolor=_hex_to_rgba(color, 0.12),
+            ),
+            row=3,
+            col=1,
+        )
+
+    fig.update_yaxes(type="log", title_text="BTC 价格 (USDT, 对数坐标)", row=1, col=1)
+    fig.update_yaxes(type="log", title_text="策略净值 (对数坐标)", row=2, col=1)
+    fig.update_yaxes(title_text="回撤 (%)", row=3, col=1)
+
+    # 下拉菜单：一次只让一个策略的买卖信号在栏 1 中可见
+    buttons = []
+    for i, name in enumerate(strategy_names):
+        visible_list = [False] * len(signal_trace_indices)
+        visible_list[2 * i] = True
+        visible_list[2 * i + 1] = True
+        buttons.append(
+            dict(label=name, method="restyle", args=[{"visible": visible_list}, signal_trace_indices])
+        )
+
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                type="dropdown",
+                buttons=buttons,
+                x=0.0,
+                xanchor="left",
+                y=1.10,
+                yanchor="top",
+                active=0,
+                showactive=True,
+            )
+        ],
+        legend=dict(groupclick="togglegroup", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        margin=dict(t=110, b=40, l=60, r=30),
+        height=1200,
+        hovermode="x unified",
+        template="plotly_white",
+    )
+
+    return fig
+
+
+def _fmt(value, digits: int = 2, suffix: str = "") -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "N/A"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def build_metrics_table_html(results: dict[str, StrategyResult], best_name: str) -> str:
+    """生成可点击表头排序的绩效对比表（原生 HTML + 内联 JS，自包含无外部依赖）。"""
+    headers = [
+        ("策略", "text"),
+        ("累计收益率 (%)", "num"),
+        ("年化收益率 (%)", "num"),
+        ("最大回撤 MDD (%)", "num"),
+        ("夏普比率", "num"),
+        ("卡玛比率", "num"),
+        ("胜率 (%)", "num"),
+        ("盈亏比", "num"),
+        ("调仓次数", "num"),
+        ("最新预测信号（T+1）", "text"),
+    ]
+
+    header_html = "".join(
+        f'<th data-type="{dtype}" onclick="sortTable({idx})">{escape(label)}<span class="sort-arrow"></span></th>'
+        for idx, (label, dtype) in enumerate(headers)
+    )
+
+    rows_html = []
     for name, result in results.items():
-        style = "-" if name == best_name else "--"
-        linewidth = 2.0 if name == best_name else 1.2
-        ax_equity.plot(dates, result.equity_curve, style, linewidth=linewidth, label=name)
-    ax_equity.set_yscale("log")
-    ax_equity.set_ylabel("策略净值 (对数坐标)")
-    ax_equity.set_title("各策略累计净值曲线对比")
-    ax_equity.legend(loc="upper left")
-    ax_equity.grid(True, which="both", linestyle="--", alpha=0.3)
+        m = result.metrics
+        signal = latest_signal(result)
+        marker = " ⭐" if name == best_name else ""
+        row_class = ' class="best-row"' if name == best_name else ""
+        signal_text = f"{signal['next_position']:.0%}（{signal['action']}）"
+        cells = [
+            escape(name) + marker,
+            _fmt(m["cumulative_return_pct"]),
+            _fmt(m["annualized_return_pct"]),
+            _fmt(m["mdd_pct"]),
+            _fmt(m["sharpe_ratio"]),
+            _fmt(m["calmar_ratio"]),
+            _fmt(m["win_rate_pct"]),
+            _fmt(m["profit_loss_ratio"]),
+            str(m["trade_count"]),
+            escape(signal_text),
+        ]
+        rows_html.append(f"<tr{row_class}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
 
-    # --- 栏 3：最佳策略动态回撤（线性坐标，红色填充）---
-    drawdown_pct = best_result.drawdown * 100
-    ax_dd.fill_between(dates, drawdown_pct, 0, color="red", alpha=0.3)
-    ax_dd.plot(dates, drawdown_pct, color="darkred", linewidth=0.8)
-    ax_dd.set_ylabel("回撤 (%)")
-    ax_dd.set_title(f"最佳策略动态回撤（{best_name}）")
-    ax_dd.grid(True, linestyle="--", alpha=0.3)
+    table_html = f"""
+    <table id="metrics-table">
+      <thead><tr>{header_html}</tr></thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    """
+    return table_html
 
-    ax_dd.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    fig.autofmt_xdate()
 
-    fig.tight_layout()
-    fig.savefig(output_path)
-    plt.close(fig)
+DASHBOARD_STYLE = """
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif; margin: 24px; color: #1a1a1a; background: #fafafa; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  p.subtitle { color: #666; margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0 28px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  th, td { border: 1px solid #e0e0e0; padding: 8px 10px; text-align: center; font-size: 13px; white-space: nowrap; }
+  th { background: #2c3e50; color: #fff; cursor: pointer; user-select: none; }
+  th:hover { background: #3d5570; }
+  tbody tr:nth-child(even) { background: #f5f7fa; }
+  tr.best-row { background: #fff6da !important; font-weight: 600; }
+  .sort-arrow::after { content: ""; margin-left: 4px; }
+  .sort-arrow.asc::after { content: "▲"; }
+  .sort-arrow.desc::after { content: "▼"; }
+  .hint { color: #888; font-size: 12px; margin-bottom: 8px; }
+</style>
+"""
+
+SORT_SCRIPT = """
+<script>
+function sortTable(colIndex) {
+  const table = document.getElementById('metrics-table');
+  const tbody = table.tBodies[0];
+  const rows = Array.from(tbody.rows);
+  const headerCell = table.tHead.rows[0].cells[colIndex];
+  const dtype = headerCell.getAttribute('data-type');
+  const currentDir = headerCell.getAttribute('data-dir') === 'asc' ? 'desc' : 'asc';
+
+  Array.from(table.tHead.rows[0].cells).forEach(cell => {
+    cell.removeAttribute('data-dir');
+    const arrow = cell.querySelector('.sort-arrow');
+    if (arrow) arrow.className = 'sort-arrow';
+  });
+  headerCell.setAttribute('data-dir', currentDir);
+  const arrow = headerCell.querySelector('.sort-arrow');
+  if (arrow) arrow.className = 'sort-arrow ' + currentDir;
+
+  rows.sort((rowA, rowB) => {
+    let a = rowA.cells[colIndex].innerText.trim();
+    let b = rowB.cells[colIndex].innerText.trim();
+    if (dtype === 'num') {
+      a = parseFloat(a.replace('%', '').replace('N/A', '-Infinity'));
+      b = parseFloat(b.replace('%', '').replace('N/A', '-Infinity'));
+      if (isNaN(a)) a = -Infinity;
+      if (isNaN(b)) b = -Infinity;
+      return currentDir === 'asc' ? a - b : b - a;
+    }
+    return currentDir === 'asc' ? a.localeCompare(b, 'zh') : b.localeCompare(a, 'zh');
+  });
+
+  rows.forEach(row => tbody.appendChild(row));
+}
+</script>
+"""
+
+
+def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str) -> str:
+    fig = build_price_and_equity_figure(df, results)
+    chart_html = fig.to_html(full_html=False, include_plotlyjs=True, div_id="backtest-chart")
+    table_html = build_metrics_table_html(results, best_name)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>加密货币多因子量化策略回测看板</title>
+{DASHBOARD_STYLE}
+</head>
+<body>
+<h1>加密货币多因子量化策略回测与可视化看板</h1>
+<p class="subtitle">数据截至 {df['timestamp'].iloc[-1].date()} · 最佳策略（按夏普比率排序）：<b>{escape(best_name)}</b></p>
+<p class="hint">点击表头可按该列排序（再次点击切换升序/降序）。</p>
+{table_html}
+{chart_html}
+{SORT_SCRIPT}
+</body>
+</html>
+"""
+
+
+def build_dashboard(df: pd.DataFrame, results: dict[str, StrategyResult], best_name: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    html = build_dashboard_html(df, results, best_name)
+    output_path.write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -470,22 +756,17 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
     lines = ["## 加密货币多因子量化策略回测报告", ""]
 
     lines.append(
-        "| 策略 | 累计收益率 (%) | 年化收益率 (%) | 最大回撤 MDD (%) | 夏普比率 | 卡玛比率 | 盈亏比 | 调仓次数 |"
+        "| 策略 | 累计收益率 (%) | 年化收益率 (%) | 最大回撤 MDD (%) | 夏普比率 | 卡玛比率 | 胜率 (%) | 盈亏比 | 调仓次数 |"
     )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-
-    def fmt(value: float, digits: int = 2) -> str:
-        if value is None or (isinstance(value, float) and np.isnan(value)):
-            return "N/A"
-        return f"{value:.{digits}f}"
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
     for name, result in results.items():
         m = result.metrics
         marker = " ⭐" if name == best_name else ""
         lines.append(
-            f"| {name}{marker} | {fmt(m['cumulative_return_pct'])} | {fmt(m['annualized_return_pct'])} | "
-            f"{fmt(m['mdd_pct'])} | {fmt(m['sharpe_ratio'])} | {fmt(m['calmar_ratio'])} | "
-            f"{fmt(m['profit_loss_ratio'])} | {m['trade_count']} |"
+            f"| {name}{marker} | {_fmt(m['cumulative_return_pct'])} | {_fmt(m['annualized_return_pct'])} | "
+            f"{_fmt(m['mdd_pct'])} | {_fmt(m['sharpe_ratio'])} | {_fmt(m['calmar_ratio'])} | "
+            f"{_fmt(m['win_rate_pct'])} | {_fmt(m['profit_loss_ratio'])} | {m['trade_count']} |"
         )
 
     lines.append("")
@@ -501,6 +782,9 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
             f"| {name} | {signal['previous_position']:.0%} | {signal['next_position']:.0%} | {signal['action']} |"
         )
     lines.append("")
+    lines.append("完整交互式看板（可切换策略、排序表格、缩放图表）请在 Workflow Artifacts 中下载 "
+                 "`backtest_dashboard.html` 查看。")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -513,8 +797,11 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
 def build_strategies() -> List[BaseStrategy]:
     return [
         BuyAndHoldStrategy(),
-        SentimentValuationStrategy(),
+        TrendFollowingStrategy(),
+        ValuationMeanReversionStrategy(),
+        SentimentRegimeStrategy(),
         MultiFactorScoringStrategy(),
+        DynamicVolTargetingStrategy(),
     ]
 
 
@@ -536,15 +823,15 @@ def main() -> None:
 
     args.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    dashboard_path = args.reports_dir / "backtest_dashboard.png"
-    plot_dashboard(df, results, best_name, dashboard_path)
+    dashboard_path = args.reports_dir / "backtest_dashboard.html"
+    build_dashboard(df, results, best_name, dashboard_path)
 
     report_markdown = build_markdown_report(results, best_name)
     summary_path = args.reports_dir / "performance_summary.md"
     summary_path.write_text(report_markdown, encoding="utf-8")
 
     print(report_markdown)
-    print(f"看板图已保存至: {dashboard_path}")
+    print(f"交互式看板已保存至: {dashboard_path}")
     print(f"Markdown 报告已保存至: {summary_path}")
 
 
