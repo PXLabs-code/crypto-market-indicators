@@ -1,23 +1,168 @@
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
+from typing import Any, Sequence
 
 import pandas as pd
 import requests
 
 COIN_METRICS_URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
-BINANCE_SPOT_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+BINANCE_SPOT_ENDPOINTS = (
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api.binance.com/api/v3/klines",
+    "https://api-gcp.binance.com/api/v3/klines",
+)
+BINANCE_FUNDING_ENDPOINTS = (
+    "https://fapi.binance.com/fapi/v1/fundingRate",
+    "https://fapi1.binance.com/fapi/v1/fundingRate",
+    "https://fapi2.binance.com/fapi/v1/fundingRate",
+)
 FNG_URL = "https://api.alternative.me/fng/"
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 REQUEST_TIMEOUT_SECONDS = 30
+BINANCE_MAX_RETRIES_PER_ENDPOINT = 3
+BINANCE_RETRY_BACKOFF_SECONDS = 1
+LOG_BODY_MAX_CHARS = 300
+BINANCE_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+BINANCE_FAILOVER_STATUS_CODES = {403, 451}
+
+LOGGER = logging.getLogger(__name__)
 
 
-def _request_json(url: str, params: dict) -> dict:
+class BinanceRequestError(RuntimeError):
+    pass
+
+
+def _request_json(url: str, params: dict) -> Any:
     response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     return response.json()
+
+
+def _truncate_for_log(text: str, max_chars: int = LOG_BODY_MAX_CHARS) -> str:
+    body = (text or "").strip()
+    if not body:
+        return "<empty body>"
+    if len(body) <= max_chars:
+        return body
+    return f"{body[:max_chars]}... [truncated]"
+
+
+def _request_binance_json(
+    endpoints: Sequence[str],
+    params: dict,
+    *,
+    service: str,
+    request_type: str,
+) -> Any:
+    failures = []
+    endpoint_count = len(endpoints)
+
+    for endpoint_index, endpoint in enumerate(endpoints, start=1):
+        has_next_endpoint = endpoint_index < endpoint_count
+        for attempt in range(1, BINANCE_MAX_RETRIES_PER_ENDPOINT + 1):
+            try:
+                response = requests.get(endpoint, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            except requests.exceptions.RequestException as exc:
+                if attempt < BINANCE_MAX_RETRIES_PER_ENDPOINT:
+                    delay = BINANCE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    LOGGER.warning(
+                        "Binance %s %s request error on endpoint %s (%d/%d), attempt %d/%d: %s; retrying in %ss",
+                        service,
+                        request_type,
+                        endpoint,
+                        endpoint_index,
+                        endpoint_count,
+                        attempt,
+                        BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                LOGGER.warning(
+                    "Binance %s %s request error on endpoint %s (%d/%d), attempt %d/%d: %s; %s",
+                    service,
+                    request_type,
+                    endpoint,
+                    endpoint_index,
+                    endpoint_count,
+                    attempt,
+                    BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                    exc,
+                    "switching to next endpoint" if has_next_endpoint else "no endpoints remaining",
+                )
+                failures.append(f"{endpoint} -> {type(exc).__name__}: {exc}")
+                break
+
+            status_code = response.status_code
+            if status_code in BINANCE_FAILOVER_STATUS_CODES:
+                body = _truncate_for_log(response.text)
+                LOGGER.warning(
+                    "Binance %s %s received HTTP %s from endpoint %s (%d/%d), attempt %d/%d, body=%r; %s",
+                    service,
+                    request_type,
+                    status_code,
+                    endpoint,
+                    endpoint_index,
+                    endpoint_count,
+                    attempt,
+                    BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                    body,
+                    "switching to next endpoint" if has_next_endpoint else "no endpoints remaining",
+                )
+                failures.append(f"{endpoint} -> HTTP {status_code}: {body}")
+                break
+
+            if status_code in BINANCE_RETRYABLE_STATUS_CODES:
+                body = _truncate_for_log(response.text)
+                if attempt < BINANCE_MAX_RETRIES_PER_ENDPOINT:
+                    delay = BINANCE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    LOGGER.warning(
+                        "Binance %s %s received HTTP %s from endpoint %s (%d/%d), attempt %d/%d, body=%r; retrying in %ss",
+                        service,
+                        request_type,
+                        status_code,
+                        endpoint,
+                        endpoint_index,
+                        endpoint_count,
+                        attempt,
+                        BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                        body,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                LOGGER.warning(
+                    "Binance %s %s received HTTP %s from endpoint %s (%d/%d), attempt %d/%d, body=%r; %s",
+                    service,
+                    request_type,
+                    status_code,
+                    endpoint,
+                    endpoint_index,
+                    endpoint_count,
+                    attempt,
+                    BINANCE_MAX_RETRIES_PER_ENDPOINT,
+                    body,
+                    "switching to next endpoint" if has_next_endpoint else "no endpoints remaining",
+                )
+                failures.append(f"{endpoint} -> HTTP {status_code}: {body}")
+                break
+
+            response.raise_for_status()
+            return response.json()
+
+    attempted = ", ".join(endpoints)
+    failure_summary = "; ".join(failures) if failures else "no endpoint attempts were recorded"
+    raise BinanceRequestError(
+        f"All Binance {service} {request_type} endpoints failed. "
+        f"Attempted endpoints: {attempted}. Final failures: {failure_summary}"
+    )
 
 
 def _load_existing(path: Path) -> pd.DataFrame:
@@ -114,7 +259,12 @@ def fetch_binance_spot_ohlcv(symbol: str, start_time: pd.Timestamp | None) -> pd
     if start_time is not None:
         params["startTime"] = int(start_time.timestamp() * 1000)
 
-    payload = _request_json(BINANCE_SPOT_URL, params)
+    payload = _request_binance_json(
+        BINANCE_SPOT_ENDPOINTS,
+        params,
+        service="spot",
+        request_type="klines",
+    )
     rows = []
     for item in payload:
         rows.append(
@@ -135,7 +285,12 @@ def fetch_binance_funding_rates(symbol: str, start_time: pd.Timestamp | None) ->
     if start_time is not None:
         params["startTime"] = int(start_time.timestamp() * 1000)
 
-    payload = _request_json(BINANCE_FUNDING_URL, params)
+    payload = _request_binance_json(
+        BINANCE_FUNDING_ENDPOINTS,
+        params,
+        service="futures",
+        request_type="fundingRate",
+    )
     rows = []
     for item in payload:
         rows.append(
