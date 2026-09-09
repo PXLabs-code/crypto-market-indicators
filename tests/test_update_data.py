@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
@@ -11,12 +13,16 @@ from scripts.update_data import (
     BINANCE_SPOT_ENDPOINTS,
     BinanceRequestError,
     FUNDING_FAILURE_POLICY_ENV,
+    FundingRateRequestError,
     FNG_KNOWN_MISSING_TIMESTAMPS,
+    OKX_FUNDING_RATE_HISTORY_URL,
     _request_binance_json,
     _truncate_for_log,
     ensure_strict_continuity,
     fetch_binance_funding_rates,
     fetch_coin_metrics_mvrv,
+    fetch_funding_rates,
+    fetch_okx_funding_rates,
     fetch_binance_spot_ohlcv,
     main,
     merge_deduplicate,
@@ -347,6 +353,62 @@ class UpdateDataTests(unittest.TestCase):
         )
 
     @patch("scripts.update_data._request_json")
+    def test_fetch_okx_funding_rates_filters_history_at_start_time(self, mock_request_json):
+        mock_request_json.side_effect = [
+            {
+                "code": "0",
+                "data": [
+                    {"fundingTime": "1728086400000", "fundingRate": "0.0002"},
+                    {"fundingTime": "1728057600000", "fundingRate": "0.0001"},
+                ],
+            },
+            {
+                "code": "0",
+                "data": [
+                    {"fundingTime": "1728028800000", "fundingRate": "0.0003"},
+                ],
+            },
+        ]
+
+        df = fetch_okx_funding_rates("BTCUSDT", pd.Timestamp("2024-10-04T16:00:00Z"))
+
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df["funding_rate"].tolist(), [0.0002, 0.0001])
+        self.assertEqual(mock_request_json.call_args_list[0].args, (OKX_FUNDING_RATE_HISTORY_URL, {"instId": "BTC-USDT-SWAP", "limit": 100}))
+        self.assertEqual(mock_request_json.call_count, 1)
+
+    @patch("scripts.update_data.fetch_okx_funding_rates")
+    @patch("scripts.update_data.fetch_binance_funding_rates")
+    def test_fetch_funding_rates_uses_okx_when_binance_is_unavailable(
+        self, mock_binance_fetch, mock_okx_fetch
+    ):
+        mock_binance_fetch.side_effect = BinanceRequestError("HTTP 451")
+        mock_okx_fetch.return_value = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2026-01-01T00:00:00Z"], utc=True), "funding_rate": [0.0001]}
+        )
+        sources = []
+
+        with self.assertLogs("scripts.update_data", level="WARNING") as logs:
+            df = fetch_funding_rates("BTCUSDT", None, sources)
+
+        self.assertEqual(len(df), 1)
+        mock_okx_fetch.assert_called_once_with("BTCUSDT", None)
+        self.assertEqual(sources, ["BTCUSDT: OKX fallback (Binance unavailable: HTTP 451)"])
+        self.assertIn("switching to OKX fallback", "\n".join(logs.output))
+
+    @patch("scripts.update_data.fetch_okx_funding_rates")
+    @patch("scripts.update_data.fetch_binance_funding_rates")
+    def test_fetch_funding_rates_reports_both_source_failures(self, mock_binance_fetch, mock_okx_fetch):
+        mock_binance_fetch.side_effect = BinanceRequestError("HTTP 451")
+        mock_okx_fetch.side_effect = FundingRateRequestError("service unavailable")
+
+        with self.assertRaises(FundingRateRequestError) as context:
+            fetch_funding_rates("BTCUSDT", None, [])
+
+        self.assertIn("Binance primary source failed: HTTP 451", str(context.exception))
+        self.assertIn("OKX fallback failed: service unavailable", str(context.exception))
+
+    @patch("scripts.update_data._request_json")
     def test_fetch_coin_metrics_mvrv_paginates_with_next_page_token(self, mock_request_json):
         mock_request_json.side_effect = [
             {
@@ -523,7 +585,7 @@ class UpdateDataTests(unittest.TestCase):
     @patch("scripts.update_data.update_fear_and_greed")
     @patch("scripts.update_data.update_asset")
     def test_main_raises_when_funding_failure_policy_is_fail(self, mock_update_asset, mock_update_fng):
-        def side_effect(asset_code, symbol, issues):
+        def side_effect(asset_code, symbol, issues, sources):
             if asset_code == "btc":
                 issues.append("BTCUSDT funding failed")
 
@@ -532,6 +594,23 @@ class UpdateDataTests(unittest.TestCase):
         with patch.dict("os.environ", {FUNDING_FAILURE_POLICY_ENV: "fail"}, clear=False):
             with self.assertRaises(RuntimeError):
                 main()
+
+    @patch("scripts.update_data.update_fear_and_greed")
+    @patch("scripts.update_data.update_asset")
+    def test_main_reports_funding_source_fallback_in_summary(self, mock_update_asset, mock_update_fng):
+        def side_effect(asset_code, symbol, issues, sources):
+            if asset_code == "btc":
+                sources.append("BTCUSDT: OKX fallback (Binance unavailable: HTTP 451)")
+
+        mock_update_asset.side_effect = side_effect
+        output = StringIO()
+
+        with patch.dict("os.environ", {FUNDING_FAILURE_POLICY_ENV: "warn"}, clear=False):
+            with redirect_stdout(output):
+                main()
+
+        self.assertIn("=== FUNDING RATE DATA SOURCES ===", output.getvalue())
+        self.assertIn("BTCUSDT: OKX fallback", output.getvalue())
 
     def test_render_non_fatal_issue_summary_includes_all_issues(self):
         issues = [
