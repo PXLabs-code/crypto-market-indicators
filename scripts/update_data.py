@@ -20,6 +20,7 @@ BINANCE_FUNDING_ENDPOINTS = (
     "https://fapi1.binance.com/fapi/v1/fundingRate",
     "https://fapi2.binance.com/fapi/v1/fundingRate",
 )
+OKX_FUNDING_RATE_HISTORY_URL = "https://www.okx.com/api/v5/public/funding-rate-history"
 FNG_URL = "https://api.alternative.me/fng/"
 FNG_KNOWN_MISSING_TIMESTAMPS = tuple(
     pd.Timestamp(day, tz="UTC")
@@ -46,6 +47,10 @@ FUNDING_FAILURE_POLICY_ENV = "FUNDING_FAILURE_POLICY"
 
 
 class BinanceRequestError(RuntimeError):
+    pass
+
+
+class FundingRateRequestError(RuntimeError):
     pass
 
 
@@ -424,6 +429,77 @@ def fetch_binance_funding_rates(symbol: str, start_time: pd.Timestamp | None) ->
     return pd.DataFrame(rows)
 
 
+def _okx_instrument_id(symbol: str) -> str:
+    if not symbol.endswith("USDT"):
+        raise ValueError(f"Unsupported funding-rate symbol for OKX fallback: {symbol}")
+    return f"{symbol[:-4]}-USDT-SWAP"
+
+
+def fetch_okx_funding_rates(symbol: str, start_time: pd.Timestamp | None) -> pd.DataFrame:
+    rows = []
+    after = None
+
+    while True:
+        params = {"instId": _okx_instrument_id(symbol), "limit": 100}
+        if after is not None:
+            params["after"] = after
+
+        try:
+            payload = _request_json(OKX_FUNDING_RATE_HISTORY_URL, params)
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            raise FundingRateRequestError(f"OKX funding-rate request failed: {exc}") from exc
+
+        if payload.get("code") != "0":
+            raise FundingRateRequestError(
+                f"OKX funding-rate request failed: {payload.get('msg') or payload.get('code')}"
+            )
+
+        batch = payload.get("data", [])
+        if not batch:
+            break
+
+        batch_timestamps = []
+        for item in batch:
+            timestamp = pd.to_datetime(int(item["fundingTime"]), unit="ms", utc=True)
+            batch_timestamps.append(timestamp)
+            if start_time is None or timestamp >= start_time:
+                rows.append({"timestamp": timestamp, "funding_rate": float(item["fundingRate"])})
+
+        oldest_timestamp = min(batch_timestamps)
+        if start_time is not None and oldest_timestamp < start_time:
+            break
+        if len(batch) < 100:
+            break
+
+        candidate_after = str(int(oldest_timestamp.timestamp() * 1000) - 1)
+        if after is not None and int(candidate_after) >= int(after):
+            raise ValueError("OKX funding-rate pagination did not move backward")
+        after = candidate_after
+
+    return pd.DataFrame(rows)
+
+
+def fetch_funding_rates(
+    symbol: str, start_time: pd.Timestamp | None, funding_sources: list[str]
+) -> pd.DataFrame:
+    try:
+        return fetch_binance_funding_rates(symbol, start_time)
+    except BinanceRequestError as binance_error:
+        LOGGER.warning(
+            "Binance funding-rate source failed for %s; switching to OKX fallback: %s",
+            symbol,
+            binance_error,
+        )
+        try:
+            rates = fetch_okx_funding_rates(symbol, start_time)
+        except FundingRateRequestError as okx_error:
+            raise FundingRateRequestError(
+                f"Binance primary source failed: {binance_error}; OKX fallback failed: {okx_error}"
+            ) from okx_error
+        funding_sources.append(f"{symbol}: OKX fallback (Binance unavailable: {binance_error})")
+        return rates
+
+
 def fetch_fear_and_greed() -> pd.DataFrame:
     payload = _request_json(FNG_URL, {"limit": 0, "format": "json"})
     rows = []
@@ -460,7 +536,7 @@ def update_series(
 
     try:
         fetched = fetch_fn(start_time)
-    except BinanceRequestError as exc:
+    except (BinanceRequestError, FundingRateRequestError) as exc:
         if allow_stale_on_fetch_error:
             has_existing_file = path.exists()
             if existing.empty:
@@ -490,7 +566,9 @@ def update_series(
     _write_if_changed(path, merged)
 
 
-def update_asset(asset_code: str, symbol: str, non_fatal_issues: list[str]) -> None:
+def update_asset(
+    asset_code: str, symbol: str, non_fatal_issues: list[str], funding_sources: list[str]
+) -> None:
     asset_dir = DATA_ROOT / asset_code
     mvrv_bootstrap_start = MVRV_BOOTSTRAP_START_TIMES.get(asset_code.lower())
 
@@ -508,7 +586,7 @@ def update_asset(asset_code: str, symbol: str, non_fatal_issues: list[str]) -> N
     )
     update_series(
         asset_dir / "funding_rates.csv",
-        lambda start: fetch_binance_funding_rates(symbol, start),
+        lambda start: fetch_funding_rates(symbol, start, funding_sources),
         continuity_frequency="8h",
         bootstrap_start_time=FUNDING_BOOTSTRAP_START_TIME,
         allow_stale_on_fetch_error=True,
@@ -536,11 +614,18 @@ def update_fear_and_greed() -> None:
 
 def main() -> None:
     non_fatal_issues: list[str] = []
-    update_asset("btc", "BTCUSDT", non_fatal_issues)
-    update_asset("eth", "ETHUSDT", non_fatal_issues)
+    funding_sources: list[str] = []
+    update_asset("btc", "BTCUSDT", non_fatal_issues, funding_sources)
+    update_asset("eth", "ETHUSDT", non_fatal_issues, funding_sources)
     update_fear_and_greed()
-    if non_fatal_issues:
-        summary = render_non_fatal_issue_summary(non_fatal_issues)
+    if non_fatal_issues or funding_sources:
+        summary_parts = []
+        if funding_sources:
+            summary_parts.append("=== FUNDING RATE DATA SOURCES ===")
+            summary_parts.extend(f"- {source}" for source in funding_sources)
+        if non_fatal_issues:
+            summary_parts.append(render_non_fatal_issue_summary(non_fatal_issues))
+        summary = "\n".join(summary_parts)
         print(summary)
         for issue in non_fatal_issues:
             print(f"::warning title=Funding rate update issue::{issue}")
