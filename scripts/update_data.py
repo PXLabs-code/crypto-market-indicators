@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -34,6 +35,7 @@ BINANCE_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 BINANCE_FAILOVER_STATUS_CODES = {403, 451}
 
 LOGGER = logging.getLogger(__name__)
+NON_FATAL_ISSUE_HEADER = "=== NON-FATAL DATA UPDATE ISSUES ==="
 
 
 class BinanceRequestError(RuntimeError):
@@ -291,6 +293,22 @@ def _write_if_changed(path: Path, df: pd.DataFrame) -> None:
     export_df.to_csv(path, index=False)
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(DATA_ROOT.parent))
+    except ValueError:
+        if "data" in path.parts:
+            data_index = path.parts.index("data")
+            return str(Path(*path.parts[data_index:]))
+        return str(path)
+
+
+def render_non_fatal_issue_summary(issues: Sequence[str]) -> str:
+    lines = [NON_FATAL_ISSUE_HEADER]
+    lines.extend(f"- {issue}" for issue in issues)
+    return "\n".join(lines)
+
+
 def fetch_coin_metrics_mvrv(asset: str, start_time: pd.Timestamp | None) -> pd.DataFrame:
     params = {"assets": asset, "metrics": "CapMVRVCur", "frequency": "1d"}
     if start_time is not None:
@@ -380,6 +398,8 @@ def update_series(
     continuity_frequency: str,
     *,
     allow_stale_on_fetch_error: bool = False,
+    non_fatal_issues: list[str] | None = None,
+    issue_context: str | None = None,
 ) -> None:
     existing = _load_existing(path)
     start_time = None
@@ -388,8 +408,9 @@ def update_series(
 
     try:
         fetched = fetch_fn(start_time)
-    except BinanceRequestError:
+    except BinanceRequestError as exc:
         if allow_stale_on_fetch_error:
+            has_existing_file = path.exists()
             if existing.empty:
                 LOGGER.warning(
                     "Skipping update for %s after Binance fetch failure; no existing data available yet",
@@ -399,6 +420,13 @@ def update_series(
                 LOGGER.warning(
                     "Skipping update for %s after Binance fetch failure; keeping existing data unchanged",
                     path,
+                )
+            if non_fatal_issues is not None:
+                context = issue_context or path.stem
+                existing_state = "present" if has_existing_file else "missing"
+                non_fatal_issues.append(
+                    f"{context} | path={_display_path(path)} | existing_file={existing_state} | "
+                    f"reason=Binance fetch failed: {exc}"
                 )
             return
         raise
@@ -410,7 +438,7 @@ def update_series(
     _write_if_changed(path, merged)
 
 
-def update_asset(asset_code: str, symbol: str) -> None:
+def update_asset(asset_code: str, symbol: str, non_fatal_issues: list[str]) -> None:
     asset_dir = DATA_ROOT / asset_code
 
     update_series(
@@ -428,6 +456,8 @@ def update_asset(asset_code: str, symbol: str) -> None:
         lambda start: fetch_binance_funding_rates(symbol, start),
         continuity_frequency="8h",
         allow_stale_on_fetch_error=True,
+        non_fatal_issues=non_fatal_issues,
+        issue_context=symbol,
     )
 
 
@@ -449,9 +479,16 @@ def update_fear_and_greed() -> None:
 
 
 def main() -> None:
-    update_asset("btc", "BTCUSDT")
-    update_asset("eth", "ETHUSDT")
+    non_fatal_issues: list[str] = []
+    update_asset("btc", "BTCUSDT", non_fatal_issues)
+    update_asset("eth", "ETHUSDT", non_fatal_issues)
     update_fear_and_greed()
+    if non_fatal_issues:
+        summary = render_non_fatal_issue_summary(non_fatal_issues)
+        print(summary)
+        issue_file = os.environ.get("NON_FATAL_ISSUES_OUTPUT")
+        if issue_file:
+            Path(issue_file).write_text(summary + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
