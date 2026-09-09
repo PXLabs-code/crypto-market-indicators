@@ -2,7 +2,7 @@
 
 读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（BTC 现货 OHLCV、
 BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，
-对 6 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
+对 8 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
 以及 Markdown 绩效对比表。
 
 设计原则：
@@ -10,6 +10,8 @@ BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一�
     - 缺失值仅允许 ``.ffill()``，不允许 ``.bfill()``，避免用未来数据填补历史空值。
     - 所有策略均输出分级仓位 {0%, 25%, 50%, 75%, 100%}，非仓位打分类信号最终都会
       对齐（snap）到这一仓位网格上。
+    - 每个策略都在 ``RULES`` 类属性中显式声明「触发条件 -> 目标仓位」的对照表，
+      供 Markdown 报告与 HTML 看板自动生成规则说明。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,6 +44,9 @@ RISK_FREE_RATE = 0.0
 MA_SHORT_WINDOW = 20
 MA_LONG_WINDOW = 200
 VOLATILITY_WINDOW = 20
+DONCHIAN_SHORT_WINDOW = 20  # 唐奇安短通道（海龟交易法则的入场系统）
+DONCHIAN_LONG_WINDOW = 55  # 唐奇安长通道（海龟交易法则的出场/趋势确认系统）
+FUNDING_MA_WINDOW = 7  # 资金费率平滑窗口，过滤单日噪音
 
 # 分级仓位网格：所有策略最终仓位都会被吸附到这 5 档上
 POSITION_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -120,8 +125,37 @@ def load_dataset(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     # MVRV 历史分位数：expanding().rank() 只使用截至当日（含）的历史数据，不引入未来信息
     df["mvrv_percentile"] = df["mvrv"].expanding(min_periods=30).rank(pct=True)
 
-    # 均线、波动率、分位数等滚动特征形成之前的行无法参与策略评估，一并丢弃
-    df = df.dropna(subset=["ma_short", "ma_long", "realized_vol", "mvrv_percentile"]).reset_index(drop=True)
+    # 唐奇安通道：用 shift(1) 后的历史高低点滚动极值，代表「过去 N 日（不含当日）」的通道上下轨，
+    # 这样「今日收盘价突破通道」才是真正的突破事件，而非当日高低点自身参与滚动导致的必然重合。
+    df["donchian_high_short"] = (
+        df["btc_high"].shift(1).rolling(DONCHIAN_SHORT_WINDOW, min_periods=DONCHIAN_SHORT_WINDOW).max()
+    )
+    df["donchian_low_short"] = (
+        df["btc_low"].shift(1).rolling(DONCHIAN_SHORT_WINDOW, min_periods=DONCHIAN_SHORT_WINDOW).min()
+    )
+    df["donchian_high_long"] = (
+        df["btc_high"].shift(1).rolling(DONCHIAN_LONG_WINDOW, min_periods=DONCHIAN_LONG_WINDOW).max()
+    )
+    df["donchian_low_long"] = (
+        df["btc_low"].shift(1).rolling(DONCHIAN_LONG_WINDOW, min_periods=DONCHIAN_LONG_WINDOW).min()
+    )
+    # 资金费率 7 日均值，平滑单日噪音以识别持续性的多空拥挤/挤压趋势
+    df["funding_rate_ma"] = df["funding_rate"].rolling(FUNDING_MA_WINDOW, min_periods=FUNDING_MA_WINDOW).mean()
+
+    # 均线、波动率、分位数、唐奇安通道等滚动特征形成之前的行无法参与策略评估，一并丢弃
+    df = df.dropna(
+        subset=[
+            "ma_short",
+            "ma_long",
+            "realized_vol",
+            "mvrv_percentile",
+            "donchian_high_short",
+            "donchian_low_short",
+            "donchian_high_long",
+            "donchian_low_long",
+            "funding_rate_ma",
+        ]
+    ).reset_index(drop=True)
 
     return df
 
@@ -137,9 +171,14 @@ class BaseStrategy(ABC):
     返回的 ``position`` 序列语义为「T 日收盘后，基于 T 日及之前可得信息决定的目标仓位」，
     取值须来自分级仓位网格 ``POSITION_GRID``（0% / 25% / 50% / 75% / 100%）。
     回测引擎会对其整体 ``shift(1)`` 后再与 T+1 日收益率相乘，从而保证不使用未来函数。
+
+    子类应在 ``RULES`` 中声明「触发条件 -> 目标仓位」的对照表（按触发优先级排列），
+    用于在 Markdown 报告和 HTML 看板中自动生成策略规则说明。
     """
 
     name: str = "BaseStrategy"
+    # 每一项为 (触发条件描述, 触发后目标仓位描述)，用于生成人类可读的规则说明表。
+    RULES: List[Tuple[str, str]] = []
 
     @abstractmethod
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
@@ -150,6 +189,7 @@ class BuyAndHoldStrategy(BaseStrategy):
     """a) Benchmark: BTC Buy & Hold —— 全程满仓 100%。"""
 
     name = "a) Buy & Hold 基准"
+    RULES = [("无条件（任何行情下均持有）", "恒定 100%，不调仓")]
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         return pd.Series(1.0, index=df.index, name="position")
@@ -163,6 +203,13 @@ class TrendFollowingStrategy(BaseStrategy):
     """
 
     name = "b) 双均线趋势策略"
+    RULES = [
+        ("(MA20-MA200)/MA200 >= 8%（强势多头排列/金叉走阔）", "买入至 100%"),
+        ("3% <= 偏离 < 8%", "加仓至 75%"),
+        ("-3% <= 偏离 < 3%（均线粘合，趋势不明）", "维持/回到 50%"),
+        ("-8% <= 偏离 < -3%", "减仓至 25%"),
+        ("偏离 < -8%（强势空头排列/死叉走阔）", "清仓至 0%"),
+    ]
 
     # 偏离幅度分级阈值：(短均线-长均线)/长均线
     THRESHOLDS = [(0.08, 1.0), (0.03, 0.75), (-0.03, 0.5), (-0.08, 0.25)]
@@ -184,6 +231,13 @@ class ValuationMeanReversionStrategy(BaseStrategy):
     """
 
     name = "c) MVRV 估值分位数策略"
+    RULES = [
+        ("MVRV 历史分位数 <= 10%（深度低估）", "买入至 100%"),
+        ("10% < 分位数 <= 30%", "加仓至 75%"),
+        ("30% < 分位数 <= 70%（估值中性）", "维持/回到 50%"),
+        ("70% < 分位数 <= 90%", "减仓至 25%"),
+        ("分位数 > 90%（历史级高估）", "清仓至 0%"),
+    ]
 
     # (分位数上限, 仓位) —— 分位数从低到高分级
     THRESHOLDS = [(0.10, 1.0), (0.30, 0.75), (0.70, 0.5), (0.90, 0.25)]
@@ -205,6 +259,13 @@ class SentimentRegimeStrategy(BaseStrategy):
     """
 
     name = "d) 情绪极值反转策略"
+    RULES = [
+        ("FGI <= 20（极度恐惧）", "逆势买入至 100%"),
+        ("20 < FGI <= 40（恐惧）", "加仓至 75%"),
+        ("40 < FGI <= 60（中性）", "维持/回到 50%"),
+        ("60 < FGI <= 80（贪婪）", "减仓至 25%"),
+        ("FGI > 80（极度贪婪）", "逆势卖出至 0%"),
+    ]
 
     # (FGI 上限, 仓位) —— FGI 从低（恐惧）到高（贪婪）分级
     THRESHOLDS = [(20, 1.0), (40, 0.75), (60, 0.5), (80, 0.25)]
@@ -274,6 +335,13 @@ class MultiFactorScoringStrategy(BaseStrategy):
     """
 
     name = "e) 多因子加权打分策略"
+    RULES = [
+        ("综合得分 >= 80（强烈看多）", "买入至 100%"),
+        ("65 <= 得分 < 80", "加仓至 75%"),
+        ("45 <= 得分 < 65（中性）", "维持/回到 50%"),
+        ("30 <= 得分 < 45", "减仓至 25%"),
+        ("得分 < 30（强烈看空）", "清仓至 0%"),
+    ]
 
     SCORE_THRESHOLDS = [(80, 1.0), (65, 0.75), (45, 0.5), (30, 0.25)]
     FLOOR_WEIGHT = 0.0  # 综合分 < 30 时清仓
@@ -296,6 +364,12 @@ class DynamicVolTargetingStrategy(BaseStrategy):
     """
 
     name = "f) 动态波动率目标策略"
+    RULES = [
+        ("基础方向仓位 = 综合得分 / 100（同 e 策略打分逻辑）", "0%~100% 连续值"),
+        ("已实现波动率（20 日年化）高于目标波动率 50%", "风险系数 < 1，仓位相应收缩"),
+        ("已实现波动率低于目标波动率 50%", "风险系数 > 1（上限 1.5 倍），仓位适度放大"),
+        ("最终仓位 = clip(基础仓位 x 风险系数, 0, 1)", "就近吸附至 0/25/50/75/100%"),
+    ]
 
     TARGET_ANNUAL_VOL = 0.5  # 目标年化波动率 50%，作为风险预算基准
     RISK_SCALE_MIN, RISK_SCALE_MAX = 0.2, 1.5
@@ -307,6 +381,79 @@ class DynamicVolTargetingStrategy(BaseStrategy):
         )
         raw_position = (base_position * risk_scale).clip(0.0, 1.0)
         return snap_to_grid(raw_position)
+
+
+class DonchianBreakoutStrategy(BaseStrategy):
+    """g) Donchian Breakout：唐奇安通道突破策略（海龟交易法则的简化分级版）。
+
+    使用两条通道：
+        - 短通道（20 日）：捕捉入场信号，价格突破短通道视为趋势启动。
+        - 长通道（55 日）：确认强趋势，价格突破长通道视为趋势的强确认。
+
+    通道均基于 ``shift(1)`` 后的历史最高/最低价滚动计算，即「过去 N 日（不含当日）」
+    的通道上下轨，因此「今日收盘价突破通道」是真正的突破事件而非同日高低点的必然重合。
+    """
+
+    name = "g) 唐奇安通道突破策略"
+    RULES = [
+        ("收盘价突破过去 55 日最高价（长通道上轨，强势新高确认）", "买入至 100%"),
+        ("收盘价突破过去 20 日最高价，但未突破 55 日最高价（短通道上轨）", "加仓至 75%"),
+        ("价格位于 20 日与 55 日通道内部（无突破，趋势未明）", "维持/回到 50%"),
+        ("收盘价跌破过去 20 日最低价，但未跌破 55 日最低价（短通道下轨）", "减仓至 25%"),
+        ("收盘价跌破过去 55 日最低价（长通道下轨，强势新低确认）", "清仓至 0%"),
+    ]
+
+    NEUTRAL_WEIGHT = 0.5
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        close = df["btc_close"]
+        # 条件按「更极端优先」排列：np.select 取首个为真的条件，
+        # 由于长通道突破必然也满足短通道突破的价格关系，须把长通道条件放在前面。
+        conditions = [
+            close > df["donchian_high_long"],
+            close > df["donchian_high_short"],
+            close < df["donchian_low_long"],
+            close < df["donchian_low_short"],
+        ]
+        choices = [1.0, 0.75, 0.0, 0.25]
+        position = pd.Series(
+            np.select(conditions, choices, default=self.NEUTRAL_WEIGHT), index=df.index, name="position"
+        )
+        return position
+
+
+class FundingRateSqueezeStrategy(BaseStrategy):
+    """h) Funding Rate Squeeze：资金费率挤压反转策略（加密货币衍生品特有信号）。
+
+    永续合约资金费率反映多空杠杆拥挤程度：
+        - 资金费率持续为负（空头向多头付费）代表空头过度拥挤，存在「逼空」反弹的
+          潜在动能，逆势加仓做多。
+        - 资金费率持续大幅为正（多头向空头付费）代表多头过度拥挤，存在「多杀多」
+          回调的潜在风险，逆势减仓规避。
+
+    使用 7 日均资金费率（``funding_rate_ma``）平滑单日噪音，只依赖历史滚动均值，
+    不引入未来数据。
+    """
+
+    name = "h) 资金费率挤压反转策略"
+    RULES = [
+        ("7 日均资金费率 <= -0.05%（空头持续付费，逼空信号）", "逆势买入至 100%"),
+        ("-0.05% < 7 日均资金费率 <= -0.01%", "加仓至 75%"),
+        ("-0.01% < 7 日均资金费率 <= 0.03%（中性）", "维持/回到 50%"),
+        ("0.03% < 7 日均资金费率 <= 0.07%（多头杠杆升温）", "减仓至 25%"),
+        ("7 日均资金费率 > 0.07%（多头严重拥挤，潜在多杀多风险）", "逆势卖出至 0%"),
+    ]
+
+    # (7 日均资金费率上限, 仓位) —— 费率从低（空头拥挤）到高（多头拥挤）分级
+    THRESHOLDS = [(-0.0005, 1.0), (-0.0001, 0.75), (0.0003, 0.5), (0.0007, 0.25)]
+    CEILING_WEIGHT = 0.0  # 7 日均资金费率 > 0.07% 时清仓
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        funding_ma = df["funding_rate_ma"]
+        position = pd.Series(self.CEILING_WEIGHT, index=df.index, name="position")
+        for threshold, weight in sorted(self.THRESHOLDS, key=lambda item: -item[0]):
+            position[funding_ma <= threshold] = weight
+        return position
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +470,7 @@ class StrategyResult:
     equity_curve: pd.Series
     drawdown: pd.Series
     trade_count: int
+    rules: List[Tuple[str, str]] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
 
 
@@ -413,6 +561,7 @@ class BacktestEngine:
                 equity_curve=equity_curve,
                 drawdown=drawdown,
                 trade_count=trade_count,
+                rules=strategy.RULES,
             )
             result.metrics = compute_metrics(result)
             self.results[strategy.name] = result
@@ -464,6 +613,8 @@ PALETTE = [
     "#d62728",  # 红
     "#9467bd",  # 紫
     "#8c564b",  # 棕
+    "#e377c2",  # 粉
+    "#17becf",  # 青
 ]
 
 
@@ -661,10 +812,38 @@ def build_metrics_table_html(results: dict[str, StrategyResult], best_name: str)
     return table_html
 
 
+def build_rules_html(results: dict[str, StrategyResult]) -> str:
+    """为每个策略生成可折叠的「触发条件 -> 目标仓位」规则说明（<details> 原生折叠，无需 JS）。"""
+    sections = []
+    for name, result in results.items():
+        if not result.rules:
+            continue
+        rows = "".join(
+            f"<tr><td>{escape(condition)}</td><td>{escape(action)}</td></tr>" for condition, action in result.rules
+        )
+        sections.append(
+            f"""
+        <details class="rule-block">
+          <summary>{escape(name)}</summary>
+          <table class="rule-table">
+            <thead><tr><th>触发条件</th><th>买入/卖出后仓位状况</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </details>
+        """
+        )
+    return f"""
+    <h2>策略规则说明（触发条件 → 目标仓位）</h2>
+    <p class="hint">点击策略名称展开/折叠该策略的具体触发条件与调仓后仓位状态。</p>
+    {''.join(sections)}
+    """
+
+
 DASHBOARD_STYLE = """
 <style>
   body { font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif; margin: 24px; color: #1a1a1a; background: #fafafa; }
   h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin: 24px 0 8px; }
   p.subtitle { color: #666; margin-top: 0; }
   table { border-collapse: collapse; width: 100%; margin: 16px 0 28px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
   th, td { border: 1px solid #e0e0e0; padding: 8px 10px; text-align: center; font-size: 13px; white-space: nowrap; }
@@ -676,6 +855,11 @@ DASHBOARD_STYLE = """
   .sort-arrow.asc::after { content: "▲"; }
   .sort-arrow.desc::after { content: "▼"; }
   .hint { color: #888; font-size: 12px; margin-bottom: 8px; }
+  details.rule-block { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 10px; padding: 10px 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  details.rule-block summary { cursor: pointer; font-weight: 600; font-size: 14px; padding: 4px 0; }
+  table.rule-table { margin: 10px 0 4px; box-shadow: none; }
+  table.rule-table th, table.rule-table td { white-space: normal; text-align: left; font-size: 12.5px; }
+  table.rule-table th:first-child, table.rule-table td:first-child { width: 62%; }
 </style>
 """
 
@@ -721,6 +905,7 @@ def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], b
     fig = build_price_and_equity_figure(df, results)
     chart_html = fig.to_html(full_html=False, include_plotlyjs=True, div_id="backtest-chart")
     table_html = build_metrics_table_html(results, best_name)
+    rules_html = build_rules_html(results)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -735,6 +920,7 @@ def build_dashboard_html(df: pd.DataFrame, results: dict[str, StrategyResult], b
 <p class="hint">点击表头可按该列排序（再次点击切换升序/降序）。</p>
 {table_html}
 {chart_html}
+{rules_html}
 {SORT_SCRIPT}
 </body>
 </html>
@@ -785,6 +971,18 @@ def build_markdown_report(results: dict[str, StrategyResult], best_name: str) ->
     lines.append("完整交互式看板（可切换策略、排序表格、缩放图表）请在 Workflow Artifacts 中下载 "
                  "`backtest_dashboard.html` 查看。")
     lines.append("")
+    lines.append("### 策略规则说明（触发条件 → 目标仓位）")
+    lines.append("")
+    for name, result in results.items():
+        if not result.rules:
+            continue
+        lines.append(f"**{name}**")
+        lines.append("")
+        lines.append("| 触发条件 | 买入/卖出后仓位状况 |")
+        lines.append("| --- | --- |")
+        for condition, action in result.rules:
+            lines.append(f"| {condition} | {action} |")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -802,6 +1000,8 @@ def build_strategies() -> List[BaseStrategy]:
         SentimentRegimeStrategy(),
         MultiFactorScoringStrategy(),
         DynamicVolTargetingStrategy(),
+        DonchianBreakoutStrategy(),
+        FundingRateSqueezeStrategy(),
     ]
 
 
