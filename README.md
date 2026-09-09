@@ -1,6 +1,10 @@
 # crypto-market-indicators
 
-自动采集并维护加密货币市场指标数据。目前支持：
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[English](README.en.md) | 简体中文
+
+自动采集并维护加密货币市场指标数据，并提供一套多因子量化策略回测与可视化系统。目前支持：
 
 - Coin Metrics：BTC、ETH 的 MVRV（`CapMVRVCur`）
 - Binance Spot：BTC/USDT、ETH/USDT 日线 OHLCV
@@ -15,13 +19,17 @@
 .
 ├── .github/
 │   └── workflows/
-│       └── update_data.yml      # GitHub Actions 自动更新任务
+│       ├── update_data.yml      # GitHub Actions 自动更新任务
+│       └── backtest.yml         # GitHub Actions 策略回测任务
 ├── scripts/
-│   └── update_data.py           # 数据采集、合并、校验与写入逻辑
+│   ├── update_data.py           # 数据采集、合并、校验与写入逻辑
+│   └── backtest.py              # 多因子策略回测与交互式看板生成
 ├── tests/
 │   └── test_update_data.py      # 数据连续性、去重和空值校验测试
 ├── data/                        # 运行脚本后生成或更新的数据目录
+├── reports/                     # 回测生成的交互式看板（带 UTC 时间戳）
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -320,6 +328,63 @@ update_asset("sol", "SOLUSDT")
 - Binance Spot 和 USDⓈ-M Futures 均支持对应交易对；
 - 数据频率满足当前严格连续性校验规则。
 
+## 多因子量化策略回测与可视化
+
+除数据采集外，仓库还提供一套完整的加密货币多因子量化策略回测系统（`scripts/backtest.py`），基于 `data/` 目录中的日度数据自动生成交互式 HTML 看板。
+
+### 数据预处理
+
+- 资金费率按 UTC 日度聚合取均值（`groupby(date).mean()`）。
+- 所有数据按 `timestamp` 以 BTC 价格日期为主轴左外连接。
+- 缺失值仅使用 `.ffill()` 前向填充，不使用 `.bfill()`，避免未来数据泄露。
+
+### 策略列表
+
+采用策略模式（`BaseStrategy` 基类 + 子类 `generate_signals(df)`），所有策略仓位均为 `[0%, 25%, 50%, 75%, 100%]` 分级仓位，且 T 日生成的仓位统一 `shift(1)` 后于 T+1 日生效，避免未来函数：
+
+| 策略 | 说明 |
+| --- | --- |
+| a) Buy & Hold 基准 | 全程 100% 仓位 |
+| b) 双均线趋势策略 | MA20/MA200 交叉与偏离幅度分级 |
+| c) MVRV 估值分位数策略 | MVRV 历史分位数高抛低吸 |
+| d) 情绪极值反转策略 | Fear & Greed Index 极值反转 |
+| e) 多因子加权打分策略 | MVRV(35%) + FGI(25%) + 资金费率(20%) + 均线(20%) 综合打分 |
+| f) 动态波动率目标策略 | 综合打分方向 x 波动率反比风险控制 |
+| g) 唐奇安通道突破策略 | 20/55 日通道突破（海龟法则简化版） |
+| h) 资金费率挤压反转策略 | 永续合约资金费率逼空/多杀多反转信号 |
+
+每个策略均在 `RULES` 类属性中显式声明「触发条件 → 目标仓位」对照表，并在看板与 Markdown 报告中展示。
+
+### 绩效指标
+
+针对加密货币 365 天年化计算：累计收益率、年化收益率、最大回撤（MDD）、夏普比率（无风险利率 0%）、卡玛比率、胜率、盈亏比、调仓次数，以及基于 $100,000 初始本金的期末净值。每次仓位变动按变动绝对值扣除单边 0.1% 的手续费与滑点。
+
+### 交互式看板
+
+运行后在 `reports/` 目录生成自包含的 Plotly HTML 看板 `backtest_dashboard_<UTC时间戳>.html`，包含：
+
+1. BTC 对数坐标价格走势，可通过下拉菜单切换查看指定策略的买卖/调仓信号标记点；
+2. 各策略累计净值曲线对比（对数坐标），可点击图例手动勾选/取消显示；
+3. 各策略动态回撤（%）填充图对比；
+4. 可排序的策略绩效指标对比表格，以及最新一日（T-0）仓位预测信号。
+
+### 本地运行
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/backtest.py
+```
+
+生成的看板会输出到 `reports/backtest_dashboard_<UTC时间戳>.html`。
+
+### GitHub Actions 自动回测
+
+工作流文件位于 `.github/workflows/backtest.yml`，名称为 **Strategy Backtest**：
+
+- 触发方式：`workflow_dispatch`（手动触发）与 `workflow_run`（在 **Update Market Data** 成功运行后自动触发）；
+- 运行回测脚本，并将策略绩效 Markdown 对比表追加至 Job Summary（`$GITHUB_STEP_SUMMARY`）；
+- 将生成的看板 HTML 提交回仓库 `reports/` 目录，并同时打包为 Workflow Artifacts（`backtest-reports`）供下载查看。
+
 ## 注意事项
 
 - 所有时间戳均按 UTC 处理。
@@ -329,8 +394,11 @@ update_asset("sol", "SOLUSDT")
 - 第三方 API 暂时不可用、限流或返回不连续数据时，任务会失败且不会写入异常结果。
 - Binance 请求会记录失败端点、状态码和截断后的响应正文；如果所有候选端点都失败，脚本会以非零退出码结束，避免写入不完整数据。
 - 如果 GitHub-hosted runner 的所有 Binance 候选出口仍然受地区或合规限制影响，可考虑改用 self-hosted runner，或接入其他兼容的数据源；备用端点不能保证一定绕过这些限制。
-- 本项目提供市场数据采集功能，不构成投资建议。
 
 ## License
 
-仓库当前未声明开源许可证。如需允许他人复制、修改或分发代码，建议添加明确的 License 文件。
+本项目采用 [MIT License](LICENSE) 开源，允许自由复制、修改、分发（包括商业用途），但不提供任何担保。
+
+## 免责声明
+
+本项目提供的市场数据采集与策略回测功能仅用于研究与技术展示，回测结果基于历史数据模拟，不代表未来收益，不构成任何投资建议。
