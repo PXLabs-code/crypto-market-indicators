@@ -2,7 +2,7 @@
 
 读取 ``data/`` 目录下由 ``update_data.py`` 维护的日度 CSV 数据（BTC 现货 OHLCV、
 BTC MVRV、BTC 资金费率、市场恐惧与贪婪指数），对齐为统一的日频面板数据后，
-对 8 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
+对 9 套仓位策略进行历史回测、计算绩效指标，并生成自包含的交互式 Plotly HTML 看板
 以及 Markdown 绩效对比表。
 
 设计原则：
@@ -478,6 +478,60 @@ class FundingRateSqueezeStrategy(BaseStrategy):
         return apply_bull_floor(position, df)
 
 
+class ConsensusVotingStrategy(BaseStrategy):
+    """i) 多策略共振投票策略：统计 b)~h) 共 7 个策略当日的调仓方向作为「投票」，
+    多数一致时才满仓/清仓，其余时间维持前一日仓位不变。
+
+    投票口径（均基于各成分策略各自的 ``generate_signals`` 输出，即 T 日收盘后
+    「即将生效」的目标仓位，不做二次 shift——本策略自身的输出仍会在
+    ``BacktestEngine.run()`` 中统一 shift(1) 防未来函数）：
+        - 买入信号：某成分策略当日目标仓位相较前一日提升（加仓/买入）。
+        - 卖出信号：某成分策略当日目标仓位相较前一日下降（减仓/卖出）。
+
+    当买入信号数 >= 3 时全仓买入（100%）；当卖出信号数 >= 4 时全仓卖出（0%）；
+    两个条件都不满足的交易日维持前一日仓位（状态持续，不做换仓）。
+    """
+
+    name = "i) 多策略共振投票策略"
+    RULES = [
+        ("b)~h) 7 个成分策略中，当日发出买入/加仓信号的数量 >= 3", "买入至 100%"),
+        ("b)~h) 7 个成分策略中，当日发出卖出/减仓信号的数量 >= 4", "卖出至 0%"),
+        ("买入信号 < 3 且卖出信号 < 4（未形成多数共振）", "维持前一日仓位不变"),
+    ]
+
+    BUY_VOTE_THRESHOLD = 3
+    SELL_VOTE_THRESHOLD = 4
+
+    @staticmethod
+    def _component_strategies() -> List[BaseStrategy]:
+        # b)~h) 共 7 个策略作为投票成分，不含 a) Buy & Hold（恒定满仓，无调仓信号可投票）。
+        return [
+            TrendFollowingStrategy(),
+            ValuationMeanReversionStrategy(),
+            SentimentRegimeStrategy(),
+            MultiFactorScoringStrategy(),
+            DynamicVolTargetingStrategy(),
+            DonchianBreakoutStrategy(),
+            FundingRateSqueezeStrategy(),
+        ]
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        buy_votes = pd.Series(0, index=df.index, dtype=int)
+        sell_votes = pd.Series(0, index=df.index, dtype=int)
+
+        for component in self._component_strategies():
+            component_position = snap_to_grid(component.generate_signals(df).clip(0.0, 1.0))
+            change = component_position.diff()
+            buy_votes = buy_votes.add((change > 1e-9).astype(int), fill_value=0)
+            sell_votes = sell_votes.add((change < -1e-9).astype(int), fill_value=0)
+
+        position = pd.Series(np.nan, index=df.index, name="position")
+        position[buy_votes >= self.BUY_VOTE_THRESHOLD] = 1.0
+        position[sell_votes >= self.SELL_VOTE_THRESHOLD] = 0.0
+        # 未触发共振阈值的交易日维持前一日仓位（状态持续）；起点视为空仓。
+        return position.ffill().fillna(0.0)
+
+
 # ---------------------------------------------------------------------------
 # 3. 回测引擎与绩效指标
 # ---------------------------------------------------------------------------
@@ -638,6 +692,7 @@ PALETTE = [
     "#8c564b",  # 棕
     "#e377c2",  # 粉
     "#17becf",  # 青
+    "#bcbd22",  # 橄榄黄
 ]
 
 
@@ -1039,6 +1094,7 @@ def build_strategies() -> List[BaseStrategy]:
         DynamicVolTargetingStrategy(),
         DonchianBreakoutStrategy(),
         FundingRateSqueezeStrategy(),
+        ConsensusVotingStrategy(),
     ]
 
 
@@ -1064,12 +1120,11 @@ def main() -> None:
     build_dashboard(df, results, best_name, dashboard_path)
 
     report_markdown = build_markdown_report(results, best_name)
-    summary_path = args.reports_dir / "performance_summary.md"
-    summary_path.write_text(report_markdown, encoding="utf-8")
 
+    # 仅打印到 stdout（供 CI 捕获后写入 $GITHUB_STEP_SUMMARY），不再落盘为
+    # reports/performance_summary.md —— reports/ 目录只产出 backtest_dashboard.html。
     print(report_markdown)
-    print(f"交互式看板已保存至: {dashboard_path}")
-    print(f"Markdown 报告已保存至: {summary_path}")
+    print(f"交互式看板已保存至: {dashboard_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
