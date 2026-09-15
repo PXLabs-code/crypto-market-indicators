@@ -21,10 +21,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-        with:
-          # workflow_run 事件默认签出触发工作流时的默认分支 HEAD；显式指定其 head_sha，
-          # 确保拿到的是「Update Market Data」提交最新数据之后的那个提交。
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
